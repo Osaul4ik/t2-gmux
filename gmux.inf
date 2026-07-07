@@ -8,7 +8,7 @@ Class=System
 ClassGuid={4D36E97D-E325-11CE-BFC1-08002BE10318}
 Provider=%ManufacturerName%
 CatalogFile=GmuxDriver.cat
-DriverVer=
+DriverVer=07/07/2026,1.0.0.0
 
 [Manufacturer]
 %ManufacturerName%=Standard,NTamd64
@@ -34,6 +34,10 @@ ServiceBinary  = %12%\GmuxDriver.sys
 
 [DestinationDirs]
 Drivers_Dir = 12
+
+; Додаємо SourceDisksFiles, щоб уникнути помилки 22.9.10
+[SourceDisksFiles]
+GmuxDriver.sys = 1,,
 
 [Strings]
 ManufacturerName = "Homebrew"
