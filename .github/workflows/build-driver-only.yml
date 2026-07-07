@@ -31,6 +31,7 @@ jobs:
           $buildDir = Join-Path $repoRoot 'build'
           $src = Join-Path $repoRoot 'driver.c'
           $obj = Join-Path $buildDir 'GmuxDriver.obj'
+          $sys = Join-Path $buildDir 'GmuxDriver.sys'
 
           if (-not (Test-Path $src)) { throw "driver.c not found at $src" }
 
@@ -70,6 +71,13 @@ jobs:
 
           Write-Host "cl $($args -join ' ')"
           & cl @args
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          if (Test-Path $obj) {
+            $linkArgs = @('/NOLOGO', '/DRIVER', '/SUBSYSTEM:NATIVE', '/ENTRY:DriverEntry', '/OUT:' + $sys, $obj)
+            Write-Host "link $($linkArgs -join ' ')"
+            & link @linkArgs
+          }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Copy INF file
