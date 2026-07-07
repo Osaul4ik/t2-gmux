@@ -228,7 +228,7 @@ jobs:
             Write-Host "Warning: gmux.inf not found in repository root"
           }
 
-      - name: Sign driver with test certificate
+      - name: Sign driver .sys with test certificate
         shell: pwsh
         run: |
           $repoRoot = if ($env:GITHUB_WORKSPACE) { $env:GITHUB_WORKSPACE } else { (Get-Location).Path }
@@ -252,13 +252,13 @@ jobs:
             Write-Host "Using existing certificate: $($cert.Subject)"
           }
 
-          Write-Host "Signing driver files with certificate: $($cert.Subject)"
+          Write-Host "Signing driver .sys file with certificate: $($cert.Subject)"
           & signtool sign /v /fd SHA256 /a /s My /n "$certName" /t http://timestamp.digicert.com $sys
-          if ($LASTEXITCODE -ne 0) { throw "signtool signing sys failed" }
-          & signtool sign /v /fd SHA256 /a /s My /n "$certName" /t http://timestamp.digicert.com $inf
-          if ($LASTEXITCODE -ne 0) { throw "signtool signing inf failed" }
+          if ($LASTEXITCODE -ne 0) { throw "signtool signing .sys failed" }
 
-          Write-Host "Driver files signed successfully."
+          Write-Host "INF file does not need signing. It will be used together with the signed .sys."
+          Write-Host "Driver .sys signed successfully."
+
           if (Test-Path "$env:TEMP\$certName.cer") {
             Copy-Item "$env:TEMP\$certName.cer" $buildDir -Force
           }
