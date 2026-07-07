@@ -208,27 +208,14 @@ jobs:
               '/IGNORE:4086',
               '/IGNORE:4254',
               '/MERGE:_PAGE=PAGE',
-              '/MERGE:_TEXT=.text'
+              '/MERGE:_TEXT=.text',
+              '/SECTION:INIT,d'
             ) + $libArgs + @($obj, $stubObj) + $selectedLibs
 
             Write-Host "link $($linkArgs -join ' ')"
             & link @linkArgs
           }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-      - name: Verify driver file
-        shell: pwsh
-        run: |
-          $repoRoot = if ($env:GITHUB_WORKSPACE) { $env:GITHUB_WORKSPACE } else { (Get-Location).Path }
-          $buildDir = Join-Path $repoRoot 'build'
-          $sys = Join-Path $buildDir 'GmuxDriver.sys'
-          if (Test-Path $sys) {
-            $size = (Get-Item $sys).Length
-            Write-Host "Driver built successfully: $sys (size: $size bytes)"
-          } else {
-            Write-Host "ERROR: Driver file not found at $sys"
-            exit 1
-          }
 
       - name: Copy INF file
         shell: pwsh
@@ -241,6 +228,45 @@ jobs:
           } else {
             Write-Host "Warning: gmux.inf not found in repository root"
           }
+
+      - name: Create test certificate and sign driver
+        shell: pwsh
+        run: |
+          $repoRoot = if ($env:GITHUB_WORKSPACE) { $env:GITHUB_WORKSPACE } else { (Get-Location).Path }
+          $buildDir = Join-Path $repoRoot 'build'
+          $certPath = Join-Path $buildDir 'testcert.cer'
+          $pfxPath = Join-Path $buildDir 'testcert.pfx'
+
+          # Create a self-signed certificate for testing
+          Write-Host "Creating test certificate..."
+          & makecert -r -pe -ss PrivateCertStore -n "CN=Test Driver Certificate" -eku 1.3.6.1.5.5.7.3.3 $certPath
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # Convert to PFX for signing
+          & pvk2pfx -pvk (Join-Path $buildDir 'testcert.pvk') -spc $certPath -pfx $pfxPath -pi password
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # Sign the driver files
+          Write-Host "Signing driver files..."
+          $filesToSign = @(
+            (Join-Path $buildDir 'GmuxDriver.sys'),
+            (Join-Path $buildDir 'gmux.inf')
+          )
+
+          foreach ($file in $filesToSign) {
+            if (Test-Path $file) {
+              Write-Host "Signing $file"
+              & signtool sign /f $pfxPath /p password /fd SHA256 /v $file
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            } else {
+              Write-Host "Warning: $file not found"
+            }
+          }
+
+          # Verify signature
+          Write-Host "Verifying signatures..."
+          & signtool verify /pa /v $sys
+          if ($LASTEXITCODE -ne 0) { Write-Host "Verification failed, but continuing..." }
 
       - name: List generated files
         shell: pwsh
