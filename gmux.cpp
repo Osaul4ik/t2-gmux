@@ -1,99 +1,65 @@
-// gmux_app.cpp
-//
-// Usermode тест-застосунок для GmuxDriver.sys.
-// Відкриває \\.\GmuxCtl і шле IOCTL_GMUX_READ8 / IOCTL_GMUX_WRITE8.
-//
-// Компіляція (mingw-w64 або cl):
-//   g++ gmux_app.cpp -o gmux_app.exe
-//
-// Запуск: від імені адміністратора, ПІСЛЯ встановлення драйвера.
-
+// gmux_test.c – консольна програма для роботи з GmuxCtl
 #include <windows.h>
-#include <cstdio>
-#include <cstring>
-#include "public.h"
+#include <stdio.h>
+#include <devioctl.h>
+#include "public.h"  // ваш заголовок з IOCTL
 
-static HANDLE OpenGmuxDevice()
-{
-    HANDLE h = CreateFileW(
-        L"\\\\.\\GmuxCtl",
-        GENERIC_READ | GENERIC_WRITE,
-        0,
-        NULL,
-        OPEN_EXISTING,
-        0,
-        NULL);
+HANDLE OpenGmux() {
+    return CreateFile(L"\\\\.\\GmuxCtl", GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
+}
 
-    if (h == INVALID_HANDLE_VALUE)
-    {
-        printf("Не вдалося відкрити \\\\.\\GmuxCtl (код помилки: %lu). "
-               "Драйвер встановлено і сервіс запущено?\n", GetLastError());
+BOOL Read8(HANDLE h, UCHAR port, PUCHAR value) {
+    GMUX_READ_REQUEST req = { port };
+    GMUX_READ_RESPONSE resp = { 0 };
+    DWORD bytes;
+    if (!DeviceIoControl(h, IOCTL_GMUX_READ8, &req, sizeof(req), &resp, sizeof(resp), &bytes, NULL)) {
+        printf("DeviceIoControl READ8 failed: %d\n", GetLastError());
+        return FALSE;
     }
-    return h;
+    if (resp.Success) *value = resp.Value;
+    return resp.Success;
 }
 
-static bool GmuxRead8(HANDLE h, UCHAR port, UCHAR* value)
-{
-    GMUX_READ_REQUEST req{ port };
-    GMUX_READ_RESPONSE resp{};
-    DWORD bytesReturned = 0;
-
-    BOOL ok = DeviceIoControl(
-        h, IOCTL_GMUX_READ8,
-        &req, sizeof(req),
-        &resp, sizeof(resp),
-        &bytesReturned, NULL);
-
-    if (!ok) return false;
-    *value = resp.Value;
-    return resp.Success != FALSE;
-}
-
-static bool GmuxWrite8(HANDLE h, UCHAR port, UCHAR value)
-{
-    GMUX_WRITE_REQUEST req{ port, value };
-    GMUX_WRITE_RESPONSE resp{};
-    DWORD bytesReturned = 0;
-
-    BOOL ok = DeviceIoControl(
-        h, IOCTL_GMUX_WRITE8,
-        &req, sizeof(req),
-        &resp, sizeof(resp),
-        &bytesReturned, NULL);
-
-    if (!ok) return false;
-    return resp.Success != FALSE;
-}
-
-int main(int argc, char** argv)
-{
-    HANDLE h = OpenGmuxDevice();
-    if (h == INVALID_HANDLE_VALUE) return 1;
-
-    UCHAR val = 0;
-
-    if (GmuxRead8(h, GMUX_PORT_VERSION_MAJOR, &val))
-        printf("GMUX_PORT_VERSION_MAJOR = 0x%02X\n", val);
-    else
-        printf("Не вдалося прочитати VERSION_MAJOR (handshake не спрацював).\n");
-
-    if (GmuxRead8(h, GMUX_PORT_SWITCH_DISPLAY, &val))
-        printf("GMUX_PORT_SWITCH_DISPLAY (поточне) = 0x%02X (%s)\n",
-               val, (val % 2 == 0) ? "iGPU" : "dGPU");
-    else
-        printf("Не вдалося прочитати SWITCH_DISPLAY.\n");
-
-    if (argc > 1 && strcmp(argv[1], "--force-igpu") == 0)
-    {
-        printf("Записую SWITCH_DISPLAY = 2 (форсувати iGPU)...\n");
-        if (GmuxWrite8(h, GMUX_PORT_SWITCH_DISPLAY, 2))
-            printf("Запис виконано.\n");
-        else
-            printf("Запис не вдався / timeout.\n");
+BOOL Write8(HANDLE h, UCHAR port, UCHAR value) {
+    GMUX_WRITE_REQUEST req = { port, value };
+    GMUX_WRITE_RESPONSE resp = { 0 };
+    DWORD bytes;
+    if (!DeviceIoControl(h, IOCTL_GMUX_WRITE8, &req, sizeof(req), &resp, sizeof(resp), &bytes, NULL)) {
+        printf("DeviceIoControl WRITE8 failed: %d\n", GetLastError());
+        return FALSE;
     }
-    else
-    {
-        printf("\n(запусти з --force-igpu щоб спробувати примусово перемкнути на iGPU)\n");
+    return resp.Success;
+}
+
+int main() {
+    HANDLE h = OpenGmux();
+    if (h == INVALID_HANDLE_VALUE) {
+        printf("Cannot open GmuxCtl. Check driver is installed.\n");
+        return 1;
+    }
+
+    UCHAR ver;
+    if (Read8(h, 0x04, &ver)) {
+        printf("GMUX version: %d (0x%02X)\n", ver, ver);
+    } else {
+        printf("Failed to read version\n");
+    }
+
+    UCHAR state;
+    if (Read8(h, 0x10, &state)) {
+        printf("Current display switch state: %d (0x%02X) – %s\n",
+               state, state, (state % 2 == 0) ? "iGPU" : "dGPU");
+    }
+
+    printf("\nWARNING: Writing to port 0x10 can switch display and may cause artifacts.\n");
+    printf("Do you want to write value 2 (force iGPU)? (y/n): ");
+    char c = getchar();
+    if (c == 'y' || c == 'Y') {
+        if (Write8(h, 0x10, 2)) {
+            printf("Write successful. Check display.\n");
+        } else {
+            printf("Write failed.\n");
+        }
     }
 
     CloseHandle(h);

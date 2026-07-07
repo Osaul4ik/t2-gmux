@@ -1,12 +1,7 @@
-// driver.c
-//
-// Мінімальний KMDF-драйвер для доступу до Apple gmux (T2 Mac) через MMIO.
-// Протокол взятий з Linux apple-gmux.c / apple-gmux.h.
-//
-// Мапить 16 байт фізичної пам'яті з бази 0xFE0B0200 (MmMapIoSpace) і
-// надає два IOCTL: IOCTL_GMUX_READ8 / IOCTL_GMUX_WRITE8 (див. public.h).
-//
-// Проєкт: Kernel Mode Driver, Empty (KMDF) у Visual Studio + WDK.
+// driver.c – KMDF драйвер для доступу до Apple gmux (T2 Mac)
+// Протокол взятий з Linux apple-gmux.c / apple-gmux.h
+// Мапить 16 байт MMIO за адресою 0xFE0B0200 тільки при першому IOCTL.
+// Надає два IOCTL: IOCTL_GMUX_READ8 / IOCTL_GMUX_WRITE8 (public.h)
 
 #include <ntddk.h>
 #include <wdf.h>
@@ -20,64 +15,103 @@
 #define OFF_PORT_SELECT  0x0E
 #define OFF_COMMAND      0x0F
 
+// ---- Типи ----
 typedef struct _DEVICE_CONTEXT {
-    PUCHAR MappedBase;
+    PUCHAR  MappedBase;
+    BOOLEAN Mapped;          // чи виконано мапінг
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetDeviceContext)
 
+// ---- Прототипи ----
 DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD EvtDeviceAdd;
 EVT_WDF_OBJECT_CONTEXT_CLEANUP EvtDeviceContextCleanup;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL EvtIoDeviceControl;
 
-// ---- Очікування, поки регістр COMMAND (0x0F) не стане 0 ----
-// Виконується на PASSIVE_LEVEL (черга WDF за замовчуванням), тому можна
-// використовувати KeDelayExecutionThread замість busy-spin.
+static BOOLEAN PollCommandClear(PUCHAR Base, ULONG TimeoutMs);
+static BOOLEAN GmuxRead8(PUCHAR Base, UCHAR Port, PUCHAR Value);
+static BOOLEAN GmuxWrite8(PUCHAR Base, UCHAR Port, UCHAR Value);
+static NTSTATUS EnsureMapped(PDEVICE_CONTEXT Context);
+static BOOLEAN GmuxDetect(PUCHAR Base);
+
+// ---- Очікування готовності ----
 static BOOLEAN
 PollCommandClear(_In_ PUCHAR Base, _In_ ULONG TimeoutMs)
 {
     ULONG waited = 0;
     LARGE_INTEGER interval;
-
-    for (;;)
-    {
+    for (;;) {
         UCHAR cmd = READ_REGISTER_UCHAR(Base + OFF_COMMAND);
-        if (cmd == 0)
-        {
-            return TRUE;
-        }
-        if (waited >= TimeoutMs)
-        {
-            return FALSE;
-        }
-        interval.QuadPart = -10000; // 1 мс, відносний інтервал
+        if (cmd == 0) return TRUE;
+        if (waited >= TimeoutMs) return FALSE;
+        interval.QuadPart = -10000; // 1 мс
         KeDelayExecutionThread(KernelMode, FALSE, &interval);
-        waited += 1;
+        waited++;
     }
 }
 
-// ---- read8(port) за протоколом gmux ----
+// ---- Read8 за протоколом ----
 static BOOLEAN
 GmuxRead8(_In_ PUCHAR Base, _In_ UCHAR Port, _Out_ PUCHAR Value)
 {
     if (!PollCommandClear(Base, 200)) return FALSE;
     WRITE_REGISTER_UCHAR(Base + OFF_PORT_SELECT, Port);
-    WRITE_REGISTER_UCHAR(Base + OFF_COMMAND, 0x01); // 0x00 | len(1)
+    WRITE_REGISTER_UCHAR(Base + OFF_COMMAND, 0x01); // read len=1
     if (!PollCommandClear(Base, 200)) return FALSE;
     *Value = READ_REGISTER_UCHAR(Base + OFF_DATA);
     return TRUE;
 }
 
-// ---- write8(port, val) за протоколом gmux ----
+// ---- Write8 за протоколом ----
 static BOOLEAN
 GmuxWrite8(_In_ PUCHAR Base, _In_ UCHAR Port, _In_ UCHAR Value)
 {
     if (!PollCommandClear(Base, 200)) return FALSE;
     WRITE_REGISTER_UCHAR(Base + OFF_DATA, Value);
     WRITE_REGISTER_UCHAR(Base + OFF_PORT_SELECT, Port);
-    WRITE_REGISTER_UCHAR(Base + OFF_COMMAND, 0x41); // 0x40 | len(1)
+    WRITE_REGISTER_UCHAR(Base + OFF_COMMAND, 0x41); // write len=1
     return PollCommandClear(Base, 200);
+}
+
+// ---- Мапінг MMIO (тільки при першому виклику) ----
+static NTSTATUS
+EnsureMapped(_In_ PDEVICE_CONTEXT Context)
+{
+    if (Context->Mapped) {
+        return STATUS_SUCCESS;
+    }
+
+    PHYSICAL_ADDRESS physAddr;
+    physAddr.QuadPart = GMUX_PHYS_BASE;
+
+    Context->MappedBase = (PUCHAR)MmMapIoSpace(physAddr, GMUX_MMIO_SIZE, MmNonCached);
+    if (Context->MappedBase == NULL) {
+        DbgPrint("[Gmux] MmMapIoSpace failed\n");
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    // Перевіряємо версію (порт 0x04) – якщо читається нормально, адреса жива
+    if (!GmuxDetect(Context->MappedBase)) {
+        DbgPrint("[Gmux] Detect failed – wrong address or hardware not present\n");
+        MmUnmapIoSpace(Context->MappedBase, GMUX_MMIO_SIZE);
+        Context->MappedBase = NULL;
+        return STATUS_DEVICE_NOT_CONNECTED;
+    }
+
+    Context->Mapped = TRUE;
+    DbgPrint("[Gmux] MMIO mapped successfully, version check passed\n");
+    return STATUS_SUCCESS;
+}
+
+// ---- Перевірка версії (безпечне читання) ----
+static BOOLEAN
+GmuxDetect(_In_ PUCHAR Base)
+{
+    UCHAR ver;
+    if (!GmuxRead8(Base, 0x04, &ver)) return FALSE;
+    DbgPrint("[Gmux] Version major = %d (0x%02X)\n", ver, ver);
+    return (ver != 0xFF && ver != 0x00); // версія має бути 1 або 2
 }
 
 // ---- DriverEntry ----
@@ -85,32 +119,26 @@ NTSTATUS
 DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING RegistryPath)
 {
     WDF_DRIVER_CONFIG config;
-
     WDF_DRIVER_CONFIG_INIT(&config, EvtDeviceAdd);
-
-    return WdfDriverCreate(
-        DriverObject,
-        RegistryPath,
-        WDF_NO_OBJECT_ATTRIBUTES,
-        &config,
-        WDF_NO_HANDLE);
+    return WdfDriverCreate(DriverObject, RegistryPath,
+                           WDF_NO_OBJECT_ATTRIBUTES, &config, WDF_NO_HANDLE);
 }
 
-// ---- Прибирання при видаленні девайса: анмапимо MMIO ----
+// ---- Очищення ----
 VOID
 EvtDeviceContextCleanup(_In_ WDFOBJECT Object)
 {
     WDFDEVICE device = (WDFDEVICE)Object;
     PDEVICE_CONTEXT context = GetDeviceContext(device);
-
-    if (context->MappedBase != NULL)
-    {
+    if (context->Mapped && context->MappedBase != NULL) {
         MmUnmapIoSpace(context->MappedBase, GMUX_MMIO_SIZE);
         context->MappedBase = NULL;
+        context->Mapped = FALSE;
+        DbgPrint("[Gmux] MMIO unmapped\n");
     }
 }
 
-// ---- EvtDeviceAdd: створення девайса, мапінг MMIO, черга IOCTL ----
+// ---- Створення пристрою (без мапінгу!) ----
 NTSTATUS
 EvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
 {
@@ -120,9 +148,6 @@ EvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
     WDF_IO_QUEUE_CONFIG queueConfig;
     WDFQUEUE queue;
     PDEVICE_CONTEXT context;
-    PHYSICAL_ADDRESS physAddr;
-
-    UNREFERENCED_PARAMETER(Driver);
 
     UNICODE_STRING symbolicLinkName;
     RtlInitUnicodeString(&symbolicLinkName, L"\\DosDevices\\GmuxCtl");
@@ -131,39 +156,26 @@ EvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
     attributes.EvtCleanupCallback = EvtDeviceContextCleanup;
 
     status = WdfDeviceCreate(&DeviceInit, &attributes, &device);
-    if (!NT_SUCCESS(status))
-    {
-        return status;
-    }
+    if (!NT_SUCCESS(status)) return status;
 
     status = WdfDeviceCreateSymbolicLink(device, &symbolicLinkName);
-    if (!NT_SUCCESS(status))
-    {
-        return status;
-    }
+    if (!NT_SUCCESS(status)) return status;
 
     context = GetDeviceContext(device);
-
-    physAddr.QuadPart = GMUX_PHYS_BASE;
-    context->MappedBase = (PUCHAR)MmMapIoSpace(physAddr, GMUX_MMIO_SIZE, MmNonCached);
-    if (context->MappedBase == NULL)
-    {
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
+    context->MappedBase = NULL;
+    context->Mapped = FALSE;
 
     WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchSequential);
     queueConfig.EvtIoDeviceControl = EvtIoDeviceControl;
 
     status = WdfIoQueueCreate(device, &queueConfig, WDF_NO_OBJECT_ATTRIBUTES, &queue);
-    if (!NT_SUCCESS(status))
-    {
-        return status;
-    }
+    if (!NT_SUCCESS(status)) return status;
 
+    DbgPrint("[Gmux] Device added, MMIO not yet mapped\n");
     return STATUS_SUCCESS;
 }
 
-// ---- Обробка IOCTL з usermode ----
+// ---- Обробка IOCTL ----
 VOID
 EvtIoDeviceControl(
     _In_ WDFQUEUE Queue,
@@ -177,13 +189,15 @@ EvtIoDeviceControl(
     PDEVICE_CONTEXT context = GetDeviceContext(device);
     size_t bytesReturned = 0;
 
-    UNREFERENCED_PARAMETER(OutputBufferLength);
-    UNREFERENCED_PARAMETER(InputBufferLength);
+    // ---- Відкладений мапінг ----
+    status = EnsureMapped(context);
+    if (!NT_SUCCESS(status)) {
+        WdfRequestCompleteWithInformation(Request, status, 0);
+        return;
+    }
 
-    switch (IoControlCode)
-    {
-    case IOCTL_GMUX_READ8:
-    {
+    switch (IoControlCode) {
+    case IOCTL_GMUX_READ8: {
         PGMUX_READ_REQUEST req = NULL;
         PGMUX_READ_RESPONSE resp = NULL;
         UCHAR value = 0;
@@ -197,10 +211,11 @@ EvtIoDeviceControl(
         resp->Success = GmuxRead8(context->MappedBase, req->Port, &value);
         resp->Value = value;
         bytesReturned = sizeof(GMUX_READ_RESPONSE);
+        DbgPrint("[Gmux] READ8 port=0x%02X value=0x%02X success=%d\n",
+                 req->Port, value, resp->Success);
         break;
     }
-    case IOCTL_GMUX_WRITE8:
-    {
+    case IOCTL_GMUX_WRITE8: {
         PGMUX_WRITE_REQUEST req = NULL;
         PGMUX_WRITE_RESPONSE resp = NULL;
 
@@ -212,6 +227,8 @@ EvtIoDeviceControl(
 
         resp->Success = GmuxWrite8(context->MappedBase, req->Port, req->Value);
         bytesReturned = sizeof(GMUX_WRITE_RESPONSE);
+        DbgPrint("[Gmux] WRITE8 port=0x%02X value=0x%02X success=%d\n",
+                 req->Port, req->Value, resp->Success);
         break;
     }
     default:
