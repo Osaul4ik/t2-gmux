@@ -17,19 +17,6 @@ jobs:
         with:
           arch: x64
 
-      - name: Install WDK and Windows SDK
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $packages = @('Microsoft.WindowsSDK.10.0', 'Microsoft.WindowsWDK.10.0')
-          foreach ($package in $packages) {
-            try {
-              winget install --id $package --accept-source-agreements --accept-package-agreements --disable-interactivity --silent
-            } catch {
-              Write-Host "Package install warning for ${package}: $($_.Exception.Message)"
-            }
-          }
-
       - name: Prepare build directory
         shell: pwsh
         run: |
@@ -44,16 +31,19 @@ jobs:
           $buildDir = Join-Path $repoRoot 'build'
           $src = Join-Path $repoRoot 'driver.c'
           $obj = Join-Path $buildDir 'GmuxDriver.obj'
-          $sdkRoot = 'C:\Program Files (x86)\Windows Kits\10'
-          $sdkVersion = Get-ChildItem "$sdkRoot\Include" -Directory | Sort-Object Name -Descending | Select-Object -First 1
-          $kmInclude = Join-Path $sdkVersion.FullName 'km'
-          $sharedInclude = Join-Path $sdkVersion.FullName 'shared'
-          $umInclude = Join-Path $sdkVersion.FullName 'um'
 
           if (-not (Test-Path $src)) { throw "driver.c not found at $src" }
-          if (-not (Test-Path $sdkVersion.FullName)) { throw "Windows SDK include directory not found" }
 
-          cl /c /nologo /TC /DWIN32 /D_WINDOWS /D_KERNEL_MODE /D_MBCS /D_UNICODE /EHsc /W3 /Zi /I"$repoRoot" /I"$kmInclude" /I"$sharedInclude" /I"$umInclude" /Fo"$obj" "$src"
+          $includeRoots = @(
+            $repoRoot,
+            'C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\km',
+            'C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared',
+            'C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um'
+          )
+
+          $includeArgs = $includeRoots | ForEach-Object { '/I"' + $_ + '"' }
+          $cmd = @('cl','/c','/nologo','/TC','/DWIN32','/D_WINDOWS','/D_KERNEL_MODE','/D_MBCS','/D_UNICODE','/EHsc','/W3','/Zi') + $includeArgs + @('/Fo"' + $obj + '"', '"' + $src + '"')
+          & $cmd[0] $cmd[1..($cmd.Length - 1)]
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Copy INF file
