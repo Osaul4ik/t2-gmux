@@ -24,13 +24,31 @@ jobs:
           $buildDir = Join-Path $repoRoot 'build'
           New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
 
+      - name: Create stub for security cookie
+        shell: pwsh
+        run: |
+          $repoRoot = if ($env:GITHUB_WORKSPACE) { $env:GITHUB_WORKSPACE } else { (Get-Location).Path }
+          $stubPath = Join-Path $repoRoot 'stub.c'
+          @'
+          // Stub for security cookie functions when /GS- is used
+          unsigned __int64 __security_cookie = 0x00002B992DDFA232;
+
+          void __security_init_cookie(void)
+          {
+              // Nothing needed for kernel mode with /GS-
+          }
+          '@ | Out-File -FilePath $stubPath -Encoding utf8
+          Write-Host "Created stub.c at $stubPath"
+
       - name: Compile kernel driver source
         shell: pwsh
         run: |
           $repoRoot = if ($env:GITHUB_WORKSPACE) { $env:GITHUB_WORKSPACE } else { (Get-Location).Path }
           $buildDir = Join-Path $repoRoot 'build'
           $src = Join-Path $repoRoot 'driver.c'
+          $stubSrc = Join-Path $repoRoot 'stub.c'
           $obj = Join-Path $buildDir 'GmuxDriver.obj'
+          $stubObj = Join-Path $buildDir 'stub.obj'
           $sys = Join-Path $buildDir 'GmuxDriver.sys'
 
           if (-not (Test-Path $src)) { throw "driver.c not found at $src" }
@@ -59,32 +77,38 @@ jobs:
             throw 'Required Windows SDK include directories were not found.'
           }
 
-          # Compile with kernel-mode flags
-          $args = @(
+          # Compile driver.c
+          $commonArgs = @(
             '/c', '/nologo', '/TC',
             '/DWIN32', '/D_WINDOWS', '/D_KERNEL_MODE', '/D_MBCS', '/D_UNICODE',
             '/D_AMD64_', '/DAMD64', '/D_X64_', '/D_WIN64',
             '/W3', '/Zi',
             '/GS-',  # Disable security cookies
-            '/Gz',   # __stdcall calling convention
-            '/Zl',   # Remove default library names from .obj
+            '/Gz',   # __stdcall
+            '/Zl',   # Omit default library names
             "/I$repoRoot",
             "/I$kmInclude",
             "/I$sharedInclude"
           )
-          if ($wdfInclude) { $args += "/I$wdfInclude" }
-          $args += @("/Fo$obj", "/Tc$src")
+          if ($wdfInclude) { $commonArgs += "/I$wdfInclude" }
 
-          Write-Host "cl $($args -join ' ')"
-          & cl @args
+          $driverArgs = $commonArgs + @("/Fo$obj", "/Tc$src")
+          Write-Host "cl $($driverArgs -join ' ')"
+          & cl @driverArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          if (Test-Path $obj) {
+          # Compile stub.c (no includes needed)
+          $stubArgs = @('/c', '/nologo', '/TC', '/GS-', '/Zl', "/Fo$stubObj", "/Tc$stubSrc")
+          Write-Host "cl $($stubArgs -join ' ')"
+          & cl @stubArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          if (Test-Path $obj -and Test-Path $stubObj) {
             $sdkLibRoot = 'C:\Program Files (x86)\Windows Kits\10\Lib'
             $libRoots = @()
             $selectedLibs = @()
 
-            # Find the appropriate SDK version for x64
+            # Find the appropriate SDK version
             $sdkVersion = Get-ChildItem -Path $sdkLibRoot -Directory -ErrorAction SilentlyContinue |
               Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
               Sort-Object Name -Descending |
@@ -96,14 +120,13 @@ jobs:
 
             Write-Host "Using SDK version: $($sdkVersion.Name)"
 
-            # Add kernel library paths
             $kernelLibPath = "$sdkLibRoot\$($sdkVersion.Name)\km\x64"
             if (Test-Path $kernelLibPath) {
               $libRoots += $kernelLibPath
               Write-Host "Added kernel library path: $kernelLibPath"
             }
 
-            # Try to find WDF libraries
+            # Find WDF libraries
             $wdfPaths = @(
               "$sdkLibRoot\wdf\kmdf\x64",
               "$sdkLibRoot\wdf\kmdf"
@@ -134,7 +157,7 @@ jobs:
               }
             }
 
-            # If WDF libraries not found, try alternative
+            # Fallback search
             if (-not $wdfFound) {
               Write-Host "Searching for WDF libraries in all locations..."
               $wdfLdr = Get-ChildItem -Path $sdkLibRoot -Filter 'WdfLdr.lib' -Recurse -ErrorAction SilentlyContinue |
@@ -155,7 +178,7 @@ jobs:
               }
             }
 
-            # Add standard kernel libraries
+            # Add kernel libraries
             $kernelLibs = @('ntoskrnl.lib', 'hal.lib')
             foreach ($name in $kernelLibs) {
               $match = Get-ChildItem -Path $kernelLibPath -Filter $name -ErrorAction SilentlyContinue |
@@ -170,26 +193,24 @@ jobs:
             $libRoots = $libRoots | Select-Object -Unique | Where-Object { Test-Path $_ }
             $selectedLibs = $selectedLibs | Select-Object -Unique
 
-            # Build linker arguments - explicitly avoid MSVC runtime
             $libArgs = $libRoots | ForEach-Object { '/LIBPATH:"' + $_ + '"' }
 
             Write-Host "Discovered linker libraries: $($selectedLibs -join ', ')"
             Write-Host "Library paths: $($libRoots -join ', ')"
             
-            # Linker flags for kernel driver
             $linkArgs = @(
               '/NOLOGO',
               '/DRIVER',
               '/SUBSYSTEM:NATIVE',
               '/ENTRY:DriverEntry',
               "/OUT:$sys",
-              '/NODEFAULTLIB',  # Don't link default libraries
-              '/IGNORE:4086',   # Ignore /BASE warning for drivers
-              '/IGNORE:4254',   # Ignore section alignment warning
+              '/NODEFAULTLIB',
+              '/IGNORE:4086',
+              '/IGNORE:4254',
               '/MERGE:_PAGE=PAGE',
               '/MERGE:_TEXT=.text',
               '/SECTION:INIT,d'
-            ) + $libArgs + @($obj) + $selectedLibs
+            ) + $libArgs + @($obj, $stubObj) + $selectedLibs
 
             Write-Host "link $($linkArgs -join ' ')"
             & link @linkArgs
