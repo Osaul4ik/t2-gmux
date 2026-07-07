@@ -90,49 +90,83 @@ jobs:
 
             Write-Host "Using SDK version: $($sdkVersion.Name)"
 
-            # Find the latest KMDF version
-            $wdfVersion = Get-ChildItem -Path "$sdkLibRoot\wdf\kmdf" -Directory -ErrorAction SilentlyContinue |
-              Where-Object { $_.Name -match '^\d+\.\d+$' } |
-              Sort-Object { [version]$_.Name } -Descending |
-              Select-Object -First 1
-
-            if (-not $wdfVersion) {
-              throw 'KMDF version directory not found'
-            }
-
-            Write-Host "Using KMDF version: $($wdfVersion.Name)"
-
             # Define the architecture-specific paths
             $archPaths = @(
-              "$sdkLibRoot\wdf\kmdf\$($wdfVersion.Name)\x64",
               "$sdkLibRoot\$($sdkVersion.Name)\km\x64",
               "$sdkLibRoot\$($sdkVersion.Name)\um\x64"
             )
 
+            # Try to find WDF libraries - different possible locations
+            $wdfPaths = @(
+              "$sdkLibRoot\wdf\kmdf\x64",
+              "$sdkLibRoot\wdf\kmdf",
+              "$sdkLibRoot\wdf",
+              "$sdkLibRoot"
+            )
+
+            $wdfFound = $false
+            foreach ($wdfPath in $wdfPaths) {
+              if (Test-Path $wdfPath) {
+                Write-Host "Checking WDF path: $wdfPath"
+                # Look for WdfLdr.lib
+                $wdfLdr = Get-ChildItem -Path $wdfPath -Filter 'WdfLdr.lib' -Recurse -ErrorAction SilentlyContinue |
+                  Where-Object { $_.FullName -match 'x64|amd64' -or $_.DirectoryName -match 'x64|amd64' } |
+                  Select-Object -First 1
+                
+                if ($wdfLdr) {
+                  Write-Host "Found WdfLdr.lib at $($wdfLdr.FullName)"
+                  $selectedLibs += $wdfLdr.FullName
+                  $libRoots += $wdfLdr.DirectoryName
+                  $wdfFound = $true
+                  
+                  # Also look for WdfDriverEntry.lib in the same directory
+                  $wdfDriverEntry = Get-ChildItem -Path $wdfLdr.DirectoryName -Filter 'WdfDriverEntry.lib' -ErrorAction SilentlyContinue |
+                    Select-Object -First 1
+                  if ($wdfDriverEntry) {
+                    Write-Host "Found WdfDriverEntry.lib at $($wdfDriverEntry.FullName)"
+                    $selectedLibs += $wdfDriverEntry.FullName
+                  }
+                  break
+                }
+              }
+            }
+
+            # If WDF libraries not found in standard locations, try to find them anywhere
+            if (-not $wdfFound) {
+              Write-Host "Searching for WDF libraries in all locations..."
+              $wdfLdr = Get-ChildItem -Path $sdkLibRoot -Filter 'WdfLdr.lib' -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match 'x64|amd64' -or $_.DirectoryName -match 'x64|amd64' } |
+                Select-Object -First 1
+              
+              if ($wdfLdr) {
+                Write-Host "Found WdfLdr.lib at $($wdfLdr.FullName) (fallback)"
+                $selectedLibs += $wdfLdr.FullName
+                $libRoots += $wdfLdr.DirectoryName
+                
+                $wdfDriverEntry = Get-ChildItem -Path $wdfLdr.DirectoryName -Filter 'WdfDriverEntry.lib' -ErrorAction SilentlyContinue |
+                  Select-Object -First 1
+                if ($wdfDriverEntry) {
+                  Write-Host "Found WdfDriverEntry.lib at $($wdfDriverEntry.FullName)"
+                  $selectedLibs += $wdfDriverEntry.FullName
+                }
+              } else {
+                Write-Host "Warning: WdfLdr.lib not found. Trying to use wdfldr.sys.lib instead..."
+                $wdfLdrSys = Get-ChildItem -Path $sdkLibRoot -Filter 'wdfldr.sys.lib' -Recurse -ErrorAction SilentlyContinue |
+                  Where-Object { $_.FullName -match 'x64|amd64' -or $_.DirectoryName -match 'x64|amd64' } |
+                  Select-Object -First 1
+                if ($wdfLdrSys) {
+                  Write-Host "Found wdfldr.sys.lib at $($wdfLdrSys.FullName)"
+                  $selectedLibs += $wdfLdrSys.FullName
+                  $libRoots += $wdfLdrSys.DirectoryName
+                }
+              }
+            }
+
+            # Add each library path
             foreach ($path in $archPaths) {
               if (Test-Path $path) {
                 $libRoots += $path
                 Write-Host "Added library path: $path"
-              }
-            }
-
-            # Add WDF library - this is the correct one for KMDF
-            $wdfLibPath = "$sdkLibRoot\wdf\kmdf\$($wdfVersion.Name)\x64"
-            if (Test-Path $wdfLibPath) {
-              # Look for WdfLdr.lib in the KMDF path
-              $wdfLdr = Get-ChildItem -Path $wdfLibPath -Filter 'WdfLdr.lib' -ErrorAction SilentlyContinue |
-                Select-Object -First 1
-              if ($wdfLdr) {
-                $selectedLibs += $wdfLdr.FullName
-                Write-Host "Found WdfLdr.lib at $($wdfLdr.FullName)"
-              }
-
-              # Also add WdfDriverEntry.lib if it exists (needed for KMDF)
-              $wdfDriverEntry = Get-ChildItem -Path $wdfLibPath -Filter 'WdfDriverEntry.lib' -ErrorAction SilentlyContinue |
-                Select-Object -First 1
-              if ($wdfDriverEntry) {
-                $selectedLibs += $wdfDriverEntry.FullName
-                Write-Host "Found WdfDriverEntry.lib at $($wdfDriverEntry.FullName)"
               }
             }
 
@@ -172,10 +206,15 @@ jobs:
               Write-Host "Added MSVC library path: $msvcLibPath"
             }
 
-            $libArgs = $libRoots | Select-Object -Unique | Where-Object { Test-Path $_ } |
-              ForEach-Object { '/LIBPATH:"' + $_ + '"' }
+            # Remove duplicates and filter valid paths
+            $libRoots = $libRoots | Select-Object -Unique | Where-Object { Test-Path $_ }
+            $selectedLibs = $selectedLibs | Select-Object -Unique
+
+            $libArgs = $libRoots | ForEach-Object { '/LIBPATH:"' + $_ + '"' }
 
             Write-Host "Discovered linker libraries: $($selectedLibs -join ', ')"
+            Write-Host "Library paths: $($libRoots -join ', ')"
+            
             $linkArgs = @('/NOLOGO', '/DRIVER', '/SUBSYSTEM:NATIVE', '/ENTRY:DriverEntry', "/OUT:$sys") + $libArgs + @($obj) + $selectedLibs
             Write-Host "link $($linkArgs -join ' ')"
             & link @linkArgs
