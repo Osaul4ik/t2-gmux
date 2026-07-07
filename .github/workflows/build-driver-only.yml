@@ -103,7 +103,6 @@ jobs:
           & cl @stubArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          # Corrected condition: use parentheses with -and
           if ((Test-Path $obj) -and (Test-Path $stubObj)) {
             $sdkLibRoot = 'C:\Program Files (x86)\Windows Kits\10\Lib'
             $libRoots = @()
@@ -209,14 +208,27 @@ jobs:
               '/IGNORE:4086',
               '/IGNORE:4254',
               '/MERGE:_PAGE=PAGE',
-              '/MERGE:_TEXT=.text',
-              '/SECTION:INIT,d'
+              '/MERGE:_TEXT=.text'
             ) + $libArgs + @($obj, $stubObj) + $selectedLibs
 
             Write-Host "link $($linkArgs -join ' ')"
             & link @linkArgs
           }
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify driver file
+        shell: pwsh
+        run: |
+          $repoRoot = if ($env:GITHUB_WORKSPACE) { $env:GITHUB_WORKSPACE } else { (Get-Location).Path }
+          $buildDir = Join-Path $repoRoot 'build'
+          $sys = Join-Path $buildDir 'GmuxDriver.sys'
+          if (Test-Path $sys) {
+            $size = (Get-Item $sys).Length
+            Write-Host "Driver built successfully: $sys (size: $size bytes)"
+          } else {
+            Write-Host "ERROR: Driver file not found at $sys"
+            exit 1
+          }
 
       - name: Copy INF file
         shell: pwsh
