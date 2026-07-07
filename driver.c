@@ -1,7 +1,7 @@
 // driver.c – KMDF драйвер для доступу до Apple gmux (T2 Mac)
+// Відкладений мапінг MMIO – тільки при першому IOCTL.
 // Протокол взятий з Linux apple-gmux.c / apple-gmux.h
-// Мапить 16 байт MMIO за адресою 0xFE0B0200 тільки при першому IOCTL.
-// Надає два IOCTL: IOCTL_GMUX_READ8 / IOCTL_GMUX_WRITE8 (public.h)
+// Мапить 16 байт за адресою 0xFE0B0200.
 
 #include <ntddk.h>
 #include <wdf.h>
@@ -15,7 +15,7 @@
 #define OFF_PORT_SELECT  0x0E
 #define OFF_COMMAND      0x0F
 
-// ---- Типи ----
+// ---- Контекст пристрою ----
 typedef struct _DEVICE_CONTEXT {
     PUCHAR  MappedBase;
     BOOLEAN Mapped;          // чи виконано мапінг
@@ -91,7 +91,7 @@ EnsureMapped(_In_ PDEVICE_CONTEXT Context)
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    // Перевіряємо версію (порт 0x04) – якщо читається нормально, адреса жива
+    // Перевірка версії (безпечне читання)
     if (!GmuxDetect(Context->MappedBase)) {
         DbgPrint("[Gmux] Detect failed – wrong address or hardware not present\n");
         MmUnmapIoSpace(Context->MappedBase, GMUX_MMIO_SIZE);
@@ -104,14 +104,15 @@ EnsureMapped(_In_ PDEVICE_CONTEXT Context)
     return STATUS_SUCCESS;
 }
 
-// ---- Перевірка версії (безпечне читання) ----
+// ---- Перевірка версії (порт 0x04) ----
 static BOOLEAN
 GmuxDetect(_In_ PUCHAR Base)
 {
     UCHAR ver;
-    if (!GmuxRead8(Base, 0x04, &ver)) return FALSE;
+    if (!GmuxRead8(Base, GMUX_PORT_VERSION_MAJOR, &ver)) return FALSE;
     DbgPrint("[Gmux] Version major = %d (0x%02X)\n", ver, ver);
-    return (ver != 0xFF && ver != 0x00); // версія має бути 1 або 2
+    // Версія має бути 1 або 2 (не 0xFF і не 0x00)
+    return (ver == 0x01 || ver == 0x02);
 }
 
 // ---- DriverEntry ----
@@ -138,7 +139,7 @@ EvtDeviceContextCleanup(_In_ WDFOBJECT Object)
     }
 }
 
-// ---- Створення пристрою (без мапінгу!) ----
+// ---- Створення пристрою (БЕЗ мапінгу!) ----
 NTSTATUS
 EvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
 {
@@ -189,7 +190,7 @@ EvtIoDeviceControl(
     PDEVICE_CONTEXT context = GetDeviceContext(device);
     size_t bytesReturned = 0;
 
-    // ---- Відкладений мапінг ----
+    // Відкладений мапінг – виконується ТІЛЬКИ тут
     status = EnsureMapped(context);
     if (!NT_SUCCESS(status)) {
         WdfRequestCompleteWithInformation(Request, status, 0);
