@@ -17,6 +17,19 @@ jobs:
         with:
           arch: x64
 
+      - name: Install WDK and Windows SDK
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $packages = @('Microsoft.WindowsSDK.10.0', 'Microsoft.WindowsWDK.10.0')
+          foreach ($package in $packages) {
+            try {
+              winget install --id $package --accept-source-agreements --accept-package-agreements --disable-interactivity --silent
+            } catch {
+              Write-Host "Package install warning for $package: $($_.Exception.Message)"
+            }
+          }
+
       - name: Prepare build directory
         shell: pwsh
         run: |
@@ -24,13 +37,24 @@ jobs:
           $buildDir = Join-Path $repoRoot 'build'
           New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
 
-      - name: Build user-mode sample
+      - name: Compile kernel driver source
         shell: pwsh
         run: |
           $repoRoot = if ($env:GITHUB_WORKSPACE) { $env:GITHUB_WORKSPACE } else { (Get-Location).Path }
           $buildDir = Join-Path $repoRoot 'build'
-          Set-Location $repoRoot
-          cl /nologo /EHsc /W3 /DUNICODE /D_UNICODE .\gmux.cpp /I. /Fe"$buildDir\gmux_app.exe"
+          $src = Join-Path $repoRoot 'driver.c'
+          $obj = Join-Path $buildDir 'GmuxDriver.obj'
+          $sdkRoot = 'C:\Program Files (x86)\Windows Kits\10'
+          $sdkVersion = Get-ChildItem "$sdkRoot\Include" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+          $kmInclude = Join-Path $sdkVersion.FullName 'km'
+          $sharedInclude = Join-Path $sdkVersion.FullName 'shared'
+          $umInclude = Join-Path $sdkVersion.FullName 'um'
+
+          if (-not (Test-Path $src)) { throw "driver.c not found at $src" }
+          if (-not (Test-Path $sdkVersion.FullName)) { throw "Windows SDK include directory not found" }
+
+          cl /c /nologo /TC /DWIN32 /D_WINDOWS /D_KERNEL_MODE /D_MBCS /D_UNICODE /EHsc /W3 /Zi /I"$repoRoot" /I"$kmInclude" /I"$sharedInclude" /I"$umInclude" /Fo"$obj" "$src"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Copy INF file
         shell: pwsh
@@ -52,7 +76,6 @@ jobs:
         with:
           name: gmux-driver-artifacts
           path: |
-            build/*.exe
-            build/*.dll
+            build/*.obj
             build/*.sys
-            build/gmux.inf
+            build/*.inf
