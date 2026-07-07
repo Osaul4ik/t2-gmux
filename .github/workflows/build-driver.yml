@@ -63,11 +63,8 @@ jobs:
         with:
           name: gmux-driver-files
           path: |
-            build\out\GmuxDriver.sys
-            build\out\gmux_app.exe
-            build\gmux.inf
-            build\GmuxDriver.vcxproj
-            gmux.inf
-            driver.c
-            public.h
-            gmux.cpp
+            build/gmux_app.exe
+            build/gmux.inf
+            build/driver.c
+            build/public.h
+            build/gmux.cpp
