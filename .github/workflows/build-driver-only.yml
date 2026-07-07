@@ -38,7 +38,7 @@ jobs:
           $sharedInclude = 'C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared'
           $umInclude = 'C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um'
 
-          $command = "cl /c /nologo /TC /DWIN32 /D_WINDOWS /D_KERNEL_MODE /D_MBCS /D_UNICODE /EHsc /W3 /Zi /I`"$repoRoot`" /I`"$kmInclude`" /I`"$sharedInclude`" /I`"$umInclude`" /Fo`"$obj`" /Tc`"$src`""
+          $command = "cl /c /nologo /TC /DWIN32 /D_WINDOWS /D_KERNEL_MODE /D_MBCS /D_UNICODE /D_AMD64_ /DAMD64 /D_X64_ /D_WIN64 /EHsc /W3 /Zi /I`"$repoRoot`" /I`"$kmInclude`" /I`"$sharedInclude`" /I`"$umInclude`" /Fo`"$obj`" /Tc`"$src`""
           Write-Host $command
           cmd /c $command
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
