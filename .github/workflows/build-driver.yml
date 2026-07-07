@@ -76,7 +76,7 @@ jobs:
       - name: Build driver with MSBuild
         run: |
           Set-Location build
-          $proj = @"
+          $proj = @'
           <?xml version="1.0" encoding="utf-8"?>
           <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
             <ItemGroup>
@@ -103,7 +103,7 @@ jobs:
               <Exec Command="cl /nologo /Zi /W3 /WX- /DWIN32 /D_WINDOWS /D_KERNEL_MODE /D_MBCS /D_UNICODE /EHsc /TP ..\driver.c /I.. /Fo$(OutDir)GmuxDriver.obj"/>
               <Exec Command="link /NOLOGO /SUBSYSTEM:NATIVE /DRIVER /ENTRY:DriverEntry /OUT:$(OutDir)GmuxDriver.sys $(OutDir)GmuxDriver.obj"/>
             </Target>
-          "@
+          '@
           Set-Content -Path './GmuxDriver.vcxproj' -Value $proj -Encoding UTF8
           msbuild .\GmuxDriver.vcxproj /t:Build /p:Configuration=Release /p:Platform=x64
           cl /nologo /EHsc /W3 /DUNICODE /D_UNICODE ..\gmux.cpp /I.. /Fe$(OutDir)gmux_app.exe
