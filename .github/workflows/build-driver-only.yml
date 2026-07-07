@@ -59,11 +59,15 @@ jobs:
             throw 'Required Windows SDK include directories were not found.'
           }
 
-          # Disable security cookies for kernel mode to avoid linking issues
+          # Compile with kernel-mode flags
           $args = @(
-            '/c', '/nologo', '/TC', '/DWIN32', '/D_WINDOWS', '/D_KERNEL_MODE', '/D_MBCS', '/D_UNICODE',
-            '/D_AMD64_', '/DAMD64', '/D_X64_', '/D_WIN64', '/EHsc', '/W3', '/Zi',
+            '/c', '/nologo', '/TC',
+            '/DWIN32', '/D_WINDOWS', '/D_KERNEL_MODE', '/D_MBCS', '/D_UNICODE',
+            '/D_AMD64_', '/DAMD64', '/D_X64_', '/D_WIN64',
+            '/W3', '/Zi',
             '/GS-',  # Disable security cookies
+            '/Gz',   # __stdcall calling convention
+            '/Zl',   # Remove default library names from .obj
             "/I$repoRoot",
             "/I$kmInclude",
             "/I$sharedInclude"
@@ -77,7 +81,7 @@ jobs:
 
           if (Test-Path $obj) {
             $sdkLibRoot = 'C:\Program Files (x86)\Windows Kits\10\Lib'
-            $libRoots = @($sdkLibRoot)
+            $libRoots = @()
             $selectedLibs = @()
 
             # Find the appropriate SDK version for x64
@@ -92,18 +96,17 @@ jobs:
 
             Write-Host "Using SDK version: $($sdkVersion.Name)"
 
-            # Define the architecture-specific paths
-            $archPaths = @(
-              "$sdkLibRoot\$($sdkVersion.Name)\km\x64",
-              "$sdkLibRoot\$($sdkVersion.Name)\um\x64"
-            )
+            # Add kernel library paths
+            $kernelLibPath = "$sdkLibRoot\$($sdkVersion.Name)\km\x64"
+            if (Test-Path $kernelLibPath) {
+              $libRoots += $kernelLibPath
+              Write-Host "Added kernel library path: $kernelLibPath"
+            }
 
             # Try to find WDF libraries
             $wdfPaths = @(
               "$sdkLibRoot\wdf\kmdf\x64",
-              "$sdkLibRoot\wdf\kmdf",
-              "$sdkLibRoot\wdf",
-              "$sdkLibRoot"
+              "$sdkLibRoot\wdf\kmdf"
             )
 
             $wdfFound = $false
@@ -149,31 +152,13 @@ jobs:
                   Write-Host "Found WdfDriverEntry.lib at $($wdfDriverEntry.FullName)"
                   $selectedLibs += $wdfDriverEntry.FullName
                 }
-              } else {
-                Write-Host "Warning: WdfLdr.lib not found. Trying wdfldr.sys.lib..."
-                $wdfLdrSys = Get-ChildItem -Path $sdkLibRoot -Filter 'wdfldr.sys.lib' -Recurse -ErrorAction SilentlyContinue |
-                  Where-Object { $_.FullName -match 'x64|amd64' -or $_.DirectoryName -match 'x64|amd64' } |
-                  Select-Object -First 1
-                if ($wdfLdrSys) {
-                  Write-Host "Found wdfldr.sys.lib at $($wdfLdrSys.FullName)"
-                  $selectedLibs += $wdfLdrSys.FullName
-                  $libRoots += $wdfLdrSys.DirectoryName
-                }
               }
             }
 
-            # Add each library path
-            foreach ($path in $archPaths) {
-              if (Test-Path $path) {
-                $libRoots += $path
-                Write-Host "Added library path: $path"
-              }
-            }
-
-            # Add standard kernel libraries (do NOT add BufferOverflowU.lib for kernel)
+            # Add standard kernel libraries
             $kernelLibs = @('ntoskrnl.lib', 'hal.lib')
             foreach ($name in $kernelLibs) {
-              $match = Get-ChildItem -Path "$sdkLibRoot\$($sdkVersion.Name)\km\x64" -Filter $name -ErrorAction SilentlyContinue |
+              $match = Get-ChildItem -Path $kernelLibPath -Filter $name -ErrorAction SilentlyContinue |
                 Select-Object -First 1
               if ($match) {
                 $selectedLibs += $match.FullName
@@ -181,23 +166,31 @@ jobs:
               }
             }
 
-            # Add MSVC runtime libraries for x64
-            $msvcLibPath = 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\lib\x64'
-            if (Test-Path $msvcLibPath) {
-              $libRoots += $msvcLibPath
-              Write-Host "Added MSVC library path: $msvcLibPath"
-            }
-
-            # Remove duplicates and filter valid paths
+            # Remove duplicates
             $libRoots = $libRoots | Select-Object -Unique | Where-Object { Test-Path $_ }
             $selectedLibs = $selectedLibs | Select-Object -Unique
 
+            # Build linker arguments - explicitly avoid MSVC runtime
             $libArgs = $libRoots | ForEach-Object { '/LIBPATH:"' + $_ + '"' }
 
             Write-Host "Discovered linker libraries: $($selectedLibs -join ', ')"
             Write-Host "Library paths: $($libRoots -join ', ')"
             
-            $linkArgs = @('/NOLOGO', '/DRIVER', '/SUBSYSTEM:NATIVE', '/ENTRY:DriverEntry', "/OUT:$sys") + $libArgs + @($obj) + $selectedLibs
+            # Linker flags for kernel driver
+            $linkArgs = @(
+              '/NOLOGO',
+              '/DRIVER',
+              '/SUBSYSTEM:NATIVE',
+              '/ENTRY:DriverEntry',
+              "/OUT:$sys",
+              '/NODEFAULTLIB',  # Don't link default libraries
+              '/IGNORE:4086',   # Ignore /BASE warning for drivers
+              '/IGNORE:4254',   # Ignore section alignment warning
+              '/MERGE:_PAGE=PAGE',
+              '/MERGE:_TEXT=.text',
+              '/SECTION:INIT,d'
+            ) + $libArgs + @($obj) + $selectedLibs
+
             Write-Host "link $($linkArgs -join ' ')"
             & link @linkArgs
           }
