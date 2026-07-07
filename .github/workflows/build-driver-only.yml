@@ -61,14 +61,16 @@ jobs:
             throw 'Required Windows SDK include directories were not found.'
           }
 
-          $includeRoots = @($repoRoot, $kmInclude, $sharedInclude, $umInclude)
-          if ($wdfInclude) { $includeRoots += $wdfInclude }
-
-          $args = @('/c','/nologo','/TC','/DWIN32','/D_WINDOWS','/D_KERNEL_MODE','/D_MBCS','/D_UNICODE','/D_AMD64_','/DAMD64','/D_X64_','/D_WIN64','/EHsc','/W3','/Zi')
-          foreach ($include in $includeRoots) {
-            $args += '/I"' + $include + '"'
-          }
-          $args += @('/Fo"' + $obj + '"', '/Tc"' + $src + '"')
+          $args = @(
+            '/c', '/nologo', '/TC', '/DWIN32', '/D_WINDOWS', '/D_KERNEL_MODE', '/D_MBCS', '/D_UNICODE',
+            '/D_AMD64_', '/DAMD64', '/D_X64_', '/D_WIN64', '/EHsc', '/W3', '/Zi',
+            "/I$repoRoot",
+            "/I$kmInclude",
+            "/I$sharedInclude",
+            "/I$umInclude"
+          )
+          if ($wdfInclude) { $args += "/I$wdfInclude" }
+          $args += @("/Fo$obj", "/Tc$src")
 
           Write-Host "cl $($args -join ' ')"
           & cl @args
