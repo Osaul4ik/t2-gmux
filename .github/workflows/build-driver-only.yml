@@ -74,26 +74,23 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           if (Test-Path $obj) {
-            $libRoots = @(
-              'C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\km\x64',
-              'C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\um\x64',
-              'C:\Program Files (x86)\Windows Kits\10\Lib\wdf\kmdf\1.9\x64'
-            )
-            $libArgs = $libRoots | Where-Object { Test-Path $_ } | ForEach-Object { '/LIBPATH:"' + $_ + '"' }
+            $sdkLibRoot = 'C:\Program Files (x86)\Windows Kits\10\Lib'
+            $libRoots = @($sdkLibRoot)
+            $selectedLibs = @()
 
-            $libFiles = @()
-            foreach ($root in $libRoots) {
-              if (Test-Path $root) {
-                $libFiles += Get-ChildItem -Path $root -Filter *.lib -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+            foreach ($name in @('wdfldr.sys.lib', 'WdfLdr.lib', 'ntoskrnl.lib', 'hal.lib')) {
+              $match = Get-ChildItem -Path $sdkLibRoot -Filter $name -Recurse -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+              if ($match) {
+                $selectedLibs += $match.FullName
+                $libRoots += $match.DirectoryName
               }
             }
 
-            $selectedLibs = @()
-            foreach ($name in @('wdfldr.sys.lib', 'WdfLdr.lib', 'ntoskrnl.lib', 'hal.lib')) {
-              $match = $libFiles | Where-Object { $_ -match [regex]::Escape($name) } | Select-Object -First 1
-              if ($match) { $selectedLibs += $match }
-            }
+            $libArgs = $libRoots | Select-Object -Unique | Where-Object { Test-Path $_ } |
+              ForEach-Object { '/LIBPATH:"' + $_ + '"' }
 
+            Write-Host "Discovered linker libraries: $($selectedLibs -join ', ')"
             $linkArgs = @('/NOLOGO', '/DRIVER', '/SUBSYSTEM:NATIVE', '/ENTRY:DriverEntry', "/OUT:$sys") + $libArgs + @($obj) + $selectedLibs
             Write-Host "link $($linkArgs -join ' ')"
             & link @linkArgs
