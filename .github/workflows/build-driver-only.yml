@@ -34,13 +34,44 @@ jobs:
 
           if (-not (Test-Path $src)) { throw "driver.c not found at $src" }
 
-          $kmInclude = 'C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\km'
-          $sharedInclude = 'C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared'
-          $umInclude = 'C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um'
+          $sdkRoot = 'C:\Program Files (x86)\Windows Kits\10\Include'
+          $kmInclude = Get-ChildItem -Path $sdkRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { Test-Path (Join-Path $_.FullName 'km') } |
+            Sort-Object Name -Descending |
+            Select-Object -First 1 | ForEach-Object { Join-Path $_.FullName 'km' }
+          $sharedInclude = Get-ChildItem -Path $sdkRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { Test-Path (Join-Path $_.FullName 'shared') } |
+            Sort-Object Name -Descending |
+            Select-Object -First 1 | ForEach-Object { Join-Path $_.FullName 'shared' }
+          $umInclude = Get-ChildItem -Path $sdkRoot -Directory -ErrorAction SilentlyContinue |
+            Where-Object { Test-Path (Join-Path $_.FullName 'um') } |
+            Sort-Object Name -Descending |
+            Select-Object -First 1 | ForEach-Object { Join-Path $_.FullName 'um' }
 
-          $command = "cl /c /nologo /TC /DWIN32 /D_WINDOWS /D_KERNEL_MODE /D_MBCS /D_UNICODE /D_AMD64_ /DAMD64 /D_X64_ /D_WIN64 /EHsc /W3 /Zi /I`"$repoRoot`" /I`"$kmInclude`" /I`"$sharedInclude`" /I`"$umInclude`" /Fo`"$obj`" /Tc`"$src`""
-          Write-Host $command
-          cmd /c $command
+          $wdfHeader = Get-ChildItem -Path $sdkRoot -Filter wdf.h -Recurse -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if ($wdfHeader) {
+            $wdfInclude = $wdfHeader.DirectoryName
+          } else {
+            $wdfInclude = $null
+          }
+
+          if (-not $kmInclude -or -not $sharedInclude -or -not $umInclude) {
+            throw 'Required Windows SDK include directories were not found.'
+          }
+
+          $includeRoots = @($repoRoot, $kmInclude, $sharedInclude, $umInclude)
+          if ($wdfInclude) { $includeRoots += $wdfInclude }
+
+          $args = @('/c','/nologo','/TC','/DWIN32','/D_WINDOWS','/D_KERNEL_MODE','/D_MBCS','/D_UNICODE','/D_AMD64_','/DAMD64','/D_X64_','/D_WIN64','/EHsc','/W3','/Zi')
+          foreach ($include in $includeRoots) {
+            $args += '/I"' + $include + '"'
+          }
+          $args += @('/Fo"' + $obj + '"', '/Tc"' + $src + '"')
+
+          Write-Host "cl $($args -join ' ')"
+          & cl @args
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Copy INF file

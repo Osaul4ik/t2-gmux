@@ -4,5 +4,12 @@
 			"path": "."
 		}
 	],
-	"settings": {}
+	"settings": {
+		"chat.tools.terminal.autoApprove": {
+			"/^cd /workspaces/Test && python3 - <<'PY'\nfrom pathlib import Path\nimport yaml\ntext = Path\\('\\.github/workflows/build-driver-only\\.yml'\\)\\.read_text\\(\\)\nyaml\\.safe_load\\(text\\)\nprint\\('YAML OK'\\)\nPY$/": {
+				"approve": true,
+				"matchCommandLine": true
+			}
+		}
+	}
 }
