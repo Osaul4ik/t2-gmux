@@ -1,0 +1,58 @@
+name: Build Driver Artifacts
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build-driver:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Prepare build directory
+        shell: pwsh
+        run: |
+          $repoRoot = if ($env:GITHUB_WORKSPACE) { $env:GITHUB_WORKSPACE } else { (Get-Location).Path }
+          $buildDir = Join-Path $repoRoot 'build'
+          New-Item -ItemType Directory -Path $buildDir -Force | Out-Null
+
+      - name: Build user-mode sample
+        shell: pwsh
+        run: |
+          $repoRoot = if ($env:GITHUB_WORKSPACE) { $env:GITHUB_WORKSPACE } else { (Get-Location).Path }
+          $buildDir = Join-Path $repoRoot 'build'
+          Set-Location $repoRoot
+          cl /nologo /EHsc /W3 /DUNICODE /D_UNICODE .\gmux.cpp /I. /Fe"$buildDir\gmux_app.exe"
+
+      - name: Copy INF file
+        shell: pwsh
+        run: |
+          $repoRoot = if ($env:GITHUB_WORKSPACE) { $env:GITHUB_WORKSPACE } else { (Get-Location).Path }
+          $buildDir = Join-Path $repoRoot 'build'
+          Copy-Item "$repoRoot\gmux.inf" "$buildDir\gmux.inf" -Force
+
+      - name: List generated files
+        shell: pwsh
+        run: |
+          $repoRoot = if ($env:GITHUB_WORKSPACE) { $env:GITHUB_WORKSPACE } else { (Get-Location).Path }
+          $buildDir = Join-Path $repoRoot 'build'
+          Write-Output 'Generated files:'
+          Get-ChildItem -Path $buildDir -Recurse | Sort-Object FullName | ForEach-Object { $_.FullName }
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gmux-driver-artifacts
+          path: |
+            build/*.exe
+            build/*.dll
+            build/*.sys
+            build/gmux.inf
