@@ -80,7 +80,21 @@ jobs:
               'C:\Program Files (x86)\Windows Kits\10\Lib\wdf\kmdf\1.9\x64'
             )
             $libArgs = $libRoots | Where-Object { Test-Path $_ } | ForEach-Object { '/LIBPATH:"' + $_ + '"' }
-            $linkArgs = @('/NOLOGO', '/DRIVER', '/SUBSYSTEM:NATIVE', '/ENTRY:DriverEntry', "/OUT:$sys") + $libArgs + @($obj, 'ntoskrnl.lib', 'hal.lib', 'wdfldr.sys.lib')
+
+            $libFiles = @()
+            foreach ($root in $libRoots) {
+              if (Test-Path $root) {
+                $libFiles += Get-ChildItem -Path $root -Filter *.lib -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+              }
+            }
+
+            $selectedLibs = @()
+            foreach ($name in @('wdfldr.sys.lib', 'WdfLdr.lib', 'ntoskrnl.lib', 'hal.lib')) {
+              $match = $libFiles | Where-Object { $_ -match [regex]::Escape($name) } | Select-Object -First 1
+              if ($match) { $selectedLibs += $match }
+            }
+
+            $linkArgs = @('/NOLOGO', '/DRIVER', '/SUBSYSTEM:NATIVE', '/ENTRY:DriverEntry', "/OUT:$sys") + $libArgs + @($obj) + $selectedLibs
             Write-Host "link $($linkArgs -join ' ')"
             & link @linkArgs
           }
