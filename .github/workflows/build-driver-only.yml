@@ -59,9 +59,11 @@ jobs:
             throw 'Required Windows SDK include directories were not found.'
           }
 
+          # Disable security cookies for kernel mode to avoid linking issues
           $args = @(
             '/c', '/nologo', '/TC', '/DWIN32', '/D_WINDOWS', '/D_KERNEL_MODE', '/D_MBCS', '/D_UNICODE',
             '/D_AMD64_', '/DAMD64', '/D_X64_', '/D_WIN64', '/EHsc', '/W3', '/Zi',
+            '/GS-',  # Disable security cookies
             "/I$repoRoot",
             "/I$kmInclude",
             "/I$sharedInclude"
@@ -96,7 +98,7 @@ jobs:
               "$sdkLibRoot\$($sdkVersion.Name)\um\x64"
             )
 
-            # Try to find WDF libraries - different possible locations
+            # Try to find WDF libraries
             $wdfPaths = @(
               "$sdkLibRoot\wdf\kmdf\x64",
               "$sdkLibRoot\wdf\kmdf",
@@ -108,7 +110,6 @@ jobs:
             foreach ($wdfPath in $wdfPaths) {
               if (Test-Path $wdfPath) {
                 Write-Host "Checking WDF path: $wdfPath"
-                # Look for WdfLdr.lib
                 $wdfLdr = Get-ChildItem -Path $wdfPath -Filter 'WdfLdr.lib' -Recurse -ErrorAction SilentlyContinue |
                   Where-Object { $_.FullName -match 'x64|amd64' -or $_.DirectoryName -match 'x64|amd64' } |
                   Select-Object -First 1
@@ -119,7 +120,6 @@ jobs:
                   $libRoots += $wdfLdr.DirectoryName
                   $wdfFound = $true
                   
-                  # Also look for WdfDriverEntry.lib in the same directory
                   $wdfDriverEntry = Get-ChildItem -Path $wdfLdr.DirectoryName -Filter 'WdfDriverEntry.lib' -ErrorAction SilentlyContinue |
                     Select-Object -First 1
                   if ($wdfDriverEntry) {
@@ -131,7 +131,7 @@ jobs:
               }
             }
 
-            # If WDF libraries not found in standard locations, try to find them anywhere
+            # If WDF libraries not found, try alternative
             if (-not $wdfFound) {
               Write-Host "Searching for WDF libraries in all locations..."
               $wdfLdr = Get-ChildItem -Path $sdkLibRoot -Filter 'WdfLdr.lib' -Recurse -ErrorAction SilentlyContinue |
@@ -150,7 +150,7 @@ jobs:
                   $selectedLibs += $wdfDriverEntry.FullName
                 }
               } else {
-                Write-Host "Warning: WdfLdr.lib not found. Trying to use wdfldr.sys.lib instead..."
+                Write-Host "Warning: WdfLdr.lib not found. Trying wdfldr.sys.lib..."
                 $wdfLdrSys = Get-ChildItem -Path $sdkLibRoot -Filter 'wdfldr.sys.lib' -Recurse -ErrorAction SilentlyContinue |
                   Where-Object { $_.FullName -match 'x64|amd64' -or $_.DirectoryName -match 'x64|amd64' } |
                   Select-Object -First 1
@@ -170,7 +170,7 @@ jobs:
               }
             }
 
-            # Add standard kernel libraries
+            # Add standard kernel libraries (do NOT add BufferOverflowU.lib for kernel)
             $kernelLibs = @('ntoskrnl.lib', 'hal.lib')
             foreach ($name in $kernelLibs) {
               $match = Get-ChildItem -Path "$sdkLibRoot\$($sdkVersion.Name)\km\x64" -Filter $name -ErrorAction SilentlyContinue |
@@ -178,24 +178,6 @@ jobs:
               if ($match) {
                 $selectedLibs += $match.FullName
                 Write-Host "Found $name at $($match.FullName)"
-              }
-            }
-
-            # Add bufferoverflowU.lib for memset and other security functions
-            $bufferLib = Get-ChildItem -Path "$sdkLibRoot\$($sdkVersion.Name)\um\x64" -Filter 'bufferoverflowU.lib' -ErrorAction SilentlyContinue |
-              Select-Object -First 1
-            if ($bufferLib) {
-              $selectedLibs += $bufferLib.FullName
-              Write-Host "Found bufferoverflowU.lib at $($bufferLib.FullName)"
-            } else {
-              # Try fallback location
-              $bufferLib = Get-ChildItem -Path $sdkLibRoot -Filter 'bufferoverflowU.lib' -Recurse -ErrorAction SilentlyContinue |
-                Where-Object { $_.FullName -match '\\x64\\' } |
-                Select-Object -First 1
-              if ($bufferLib) {
-                $selectedLibs += $bufferLib.FullName
-                $libRoots += $bufferLib.DirectoryName
-                Write-Host "Found bufferoverflowU.lib at $($bufferLib.FullName) (fallback)"
               }
             }
 
