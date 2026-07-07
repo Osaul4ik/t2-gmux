@@ -228,6 +228,16 @@ jobs:
             Write-Host "Warning: gmux.inf not found in repository root"
           }
 
+      - name: Install Windows Driver Kit (WDK) for inf2cat
+        shell: pwsh
+        run: |
+          Write-Host "Installing Windows WDK via Chocolatey..."
+          choco install windows-wdk -y
+          if ($LASTEXITCODE -ne 0) { throw "WDK installation failed" }
+          # Add WDK bin to PATH
+          $env:Path += ";C:\Program Files (x86)\Windows Kits\10\bin\x64"
+          Write-Host "WDK installed successfully."
+
       - name: Sign driver with test certificate (including CAT)
         shell: pwsh
         run: |
@@ -261,15 +271,29 @@ jobs:
             Set-Content $inf $infContent
           }
 
-          # Locate inf2cat.exe using Windows SDK environment variables
+          # Locate inf2cat.exe (now installed via WDK)
           $inf2catExe = "$env:WindowsSdkVerBinPath\x64\inf2cat.exe"
           if (-not (Test-Path $inf2catExe)) {
-            Write-Host "inf2cat not found at $inf2catExe, searching..."
-            $inf2catExe = Get-ChildItem -Path "$env:WindowsSdkDir\bin" -Filter inf2cat.exe -Recurse -ErrorAction SilentlyContinue |
+            # Try common locations
+            $possiblePaths = @(
+              "C:\Program Files (x86)\Windows Kits\10\bin\x64\inf2cat.exe",
+              "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\inf2cat.exe",
+              "C:\Program Files (x86)\Windows Kits\10\Tools\x64\inf2cat.exe"
+            )
+            foreach ($p in $possiblePaths) {
+              if (Test-Path $p) {
+                $inf2catExe = $p
+                break
+              }
+            }
+          }
+          if (-not $inf2catExe) {
+            Write-Host "inf2cat.exe still not found, searching recursively..."
+            $inf2catExe = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits" -Filter inf2cat.exe -Recurse -ErrorAction SilentlyContinue |
               Where-Object { $_.FullName -match 'x64' } |
               Select-Object -First 1 -ExpandProperty FullName
           }
-          if (-not $inf2catExe) { throw "inf2cat.exe not found" }
+          if (-not $inf2catExe) { throw "inf2cat.exe not found after WDK installation" }
           Write-Host "Using inf2cat: $inf2catExe"
 
           # Create catalog file (CAT)
