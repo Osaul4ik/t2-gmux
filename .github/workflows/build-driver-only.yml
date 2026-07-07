@@ -245,14 +245,9 @@ jobs:
             Write-Host "Creating test certificate using New-SelfSignedCertificate..."
             $cert = New-SelfSignedCertificate -Type CodeSigningCert -Subject "CN=$certName" -CertStoreLocation Cert:\CurrentUser\My -KeyUsage DigitalSignature -KeyAlgorithm RSA -KeyLength 2048
             if (-not $cert) { throw "Failed to create certificate" }
-            # Export certificate
             $certPath = "$env:TEMP\$certName.cer"
             $cert | Export-Certificate -FilePath $certPath -Type CERT
             Write-Host "Certificate exported to $certPath"
-            # Import to Root store using Import-Certificate (non-interactive)
-            Import-Certificate -FilePath $certPath -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "Import-Certificate to Root failed" }
-            Write-Host "Certificate imported to LocalMachine\Root."
           } else {
             Write-Host "Using existing certificate: $($cert.Subject)"
           }
