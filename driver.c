@@ -124,7 +124,8 @@ EvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
 
     UNREFERENCED_PARAMETER(Driver);
 
-    DECLARE_CONST_UNICODE_STRING(symbolicLinkName, L"\\DosDevices\\GmuxCtl");
+    UNICODE_STRING symbolicLinkName;
+    RtlInitUnicodeString(&symbolicLinkName, L"\\DosDevices\\GmuxCtl");
 
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, DEVICE_CONTEXT);
     attributes.EvtCleanupCallback = EvtDeviceContextCleanup;
