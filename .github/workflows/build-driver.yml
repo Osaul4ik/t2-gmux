@@ -1,0 +1,128 @@
+name: Build Windows Kernel Driver
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install WDK
+        uses: microsoft/windows-dev-kit@v1
+        with:
+          version: latest
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v1
+
+      - name: Create driver build files
+        run: |
+          if (-not (Test-Path build)) { New-Item -ItemType Directory -Path build | Out-Null }
+          Set-Location build
+          $inf = Join-Path $PSScriptRoot 'gmux.inf'
+          $src = Join-Path $PSScriptRoot 'driver.c'
+          $hdr = Join-Path $PSScriptRoot 'public.h'
+          if (-not (Test-Path $inf)) { Write-Error 'gmux.inf not found'; exit 1 }
+          $content = @"
+[version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4D36E97D-E325-11CE-BFC1-08002BE10318}
+Provider=%ManufacturerName%
+DriverVer=01/01/2026,1.0.0.0
+
+[Manufacturer]
+%ManufacturerName%=Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceDesc%=GmuxDriver_Device, root\GmuxDriver
+
+[GmuxDriver_Device.NT]
+CopyFiles=Drivers_Dir
+
+[Drivers_Dir]
+GmuxDriver.sys
+
+[GmuxDriver_Device.NT.Services]
+AddService = GmuxDriver,0x000001fa,GmuxDriver_Service_Inst
+
+[GmuxDriver_Service_Inst]
+DisplayName    = %ServiceDesc%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %12%\GmuxDriver.sys
+
+[DestinationDirs]
+Drivers_Dir = 12
+
+[Strings]
+ManufacturerName = "Homebrew"
+DeviceDesc = "Apple GMUX Control Device"
+ServiceDesc = "GMUX Control Service"
+"@
+          Set-Content -Path './gmux.inf' -Value $content -Encoding UTF8
+
+      - name: Build driver with MSBuild
+        run: |
+          Set-Location build
+          $proj = @"
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <ClCompile Include="..\driver.c" />
+    <ClInclude Include="..\public.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="..\gmux.inf" />
+  </ItemGroup>
+  <PropertyGroup>
+    <Configuration>Release</Configuration>
+    <Platform>x64</Platform>
+    <TargetName>GmuxDriver</TargetName>
+    <OutDir>$(MSBuildThisFileDirectory)\out\</OutDir>
+  </PropertyGroup>
+  <Import Project="$(MSBuildToolsPath)\Microsoft.Cpp.Default.props" />
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="Build">
+    <Message Text="Building driver" Importance="high" />
+    <MakeDir Directories="$(OutDir)" />
+    <CL Include="@(ClCompile)">
+      <AdditionalOptions>/DWIN32 /D_WINDOWS /W3 /WX- /Zi /TP /await /Yu"pch.h" /I"$(VCInstallDir)\Tools\MSVC\$(VCToolsVersion)\include" /I"$(WindowsSdkDir)\Include\$(WindowsTargetPlatformVersion)\um" /I"$(WindowsSdkDir)\Include\$(WindowsTargetPlatformVersion)\shared" /I"$(WindowsSdkDir)\Include\$(WindowsTargetPlatformVersion)\km" /I"$(WindowsSdkDir)\Include\$(WindowsTargetPlatformVersion)\winrt" /I"$(WDKContentRoot)\Inc\10.0.19041.0\km" /I"$(WDKContentRoot)\Inc\10.0.19041.0\shared"
+    </CL>
+    <Exec Command="cl /nologo /Zi /W3 /WX- /DWIN32 /D_WINDOWS /D_KERNEL_MODE /D_MBCS /D_UNICODE /EHsc /TP ..\driver.c /I.. /Fo$(OutDir)GmuxDriver.obj"/>
+    <Exec Command="link /NOLOGO /SUBSYSTEM:NATIVE /DRIVER /ENTRY:DriverEntry /OUT:$(OutDir)GmuxDriver.sys $(OutDir)GmuxDriver.obj"/>
+  </Target>
+"@
+          Set-Content -Path './GmuxDriver.vcxproj' -Value $proj -Encoding UTF8
+          msbuild .\GmuxDriver.vcxproj /t:Build /p:Configuration=Release /p:Platform=x64
+          cl /nologo /EHsc /W3 /DUNICODE /D_UNICODE ..\gmux.cpp /I.. /Fe$(OutDir)gmux_app.exe
+
+      - name: List build output files
+        run: |
+          Set-Location build
+          Write-Output '=== Repository files ==='
+          Get-ChildItem -Path .. -File | Sort-Object Name | Format-Table -AutoSize
+          Write-Output '=== Build directory ==='
+          Get-ChildItem -Path . -Recurse | Sort-Object FullName | Format-Table -AutoSize
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: gmux-driver-files
+          path: |
+            build\out\GmuxDriver.sys
+            build\out\gmux_app.exe
+            build\gmux.inf
+            build\GmuxDriver.vcxproj
+            gmux.inf
+            driver.c
+            public.h
+            gmux.cpp
