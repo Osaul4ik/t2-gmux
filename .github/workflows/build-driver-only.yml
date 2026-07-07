@@ -103,7 +103,8 @@ jobs:
           & cl @stubArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          if (Test-Path $obj -and Test-Path $stubObj) {
+          # Corrected condition: use parentheses with -and
+          if ((Test-Path $obj) -and (Test-Path $stubObj)) {
             $sdkLibRoot = 'C:\Program Files (x86)\Windows Kits\10\Lib'
             $libRoots = @()
             $selectedLibs = @()
