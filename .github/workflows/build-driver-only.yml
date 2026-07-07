@@ -261,9 +261,20 @@ jobs:
             Set-Content $inf $infContent
           }
 
+          # Locate inf2cat.exe using Windows SDK environment variables
+          $inf2catExe = "$env:WindowsSdkVerBinPath\x64\inf2cat.exe"
+          if (-not (Test-Path $inf2catExe)) {
+            Write-Host "inf2cat not found at $inf2catExe, searching..."
+            $inf2catExe = Get-ChildItem -Path "$env:WindowsSdkDir\bin" -Filter inf2cat.exe -Recurse -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match 'x64' } |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $inf2catExe) { throw "inf2cat.exe not found" }
+          Write-Host "Using inf2cat: $inf2catExe"
+
           # Create catalog file (CAT)
           Write-Host "Creating catalog file using inf2cat..."
-          & inf2cat /driver:$buildDir /os:10_X64 /verbose
+          & $inf2catExe /driver:$buildDir /os:10_X64 /verbose
           if ($LASTEXITCODE -ne 0) { throw "inf2cat failed" }
 
           if (-not (Test-Path $cat)) {
