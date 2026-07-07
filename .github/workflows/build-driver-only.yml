@@ -42,8 +42,8 @@ jobs:
           )
 
           $includeArgs = $includeRoots | ForEach-Object { '/I"' + $_ + '"' }
-          $cmd = @('cl','/c','/nologo','/TC','/DWIN32','/D_WINDOWS','/D_KERNEL_MODE','/D_MBCS','/D_UNICODE','/EHsc','/W3','/Zi') + $includeArgs + @('/Fo"' + $obj + '"', '"' + $src + '"')
-          & $cmd[0] $cmd[1..($cmd.Length - 1)]
+          $args = @('/c','/nologo','/TC','/DWIN32','/D_WINDOWS','/D_KERNEL_MODE','/D_MBCS','/D_UNICODE','/EHsc','/W3','/Zi') + $includeArgs + @('/Fo' + $obj, $src)
+          & cl @args
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Copy INF file
