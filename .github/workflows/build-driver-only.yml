@@ -43,12 +43,9 @@ jobs:
             Where-Object { Test-Path (Join-Path $_.FullName 'shared') } |
             Sort-Object Name -Descending |
             Select-Object -First 1 | ForEach-Object { Join-Path $_.FullName 'shared' }
-          $umInclude = Get-ChildItem -Path $sdkRoot -Directory -ErrorAction SilentlyContinue |
-            Where-Object { Test-Path (Join-Path $_.FullName 'um') } |
-            Sort-Object Name -Descending |
-            Select-Object -First 1 | ForEach-Object { Join-Path $_.FullName 'um' }
 
-          $wdfHeader = Get-ChildItem -Path $sdkRoot -Filter wdf.h -Recurse -ErrorAction SilentlyContinue |
+          $wdfHeader = Get-ChildItem -Path (Join-Path $sdkRoot 'wdf') -Filter wdf.h -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.FullName -match 'kmdf' } |
             Sort-Object FullName -Descending |
             Select-Object -First 1
           if ($wdfHeader) {
@@ -57,7 +54,7 @@ jobs:
             $wdfInclude = $null
           }
 
-          if (-not $kmInclude -or -not $sharedInclude -or -not $umInclude) {
+          if (-not $kmInclude -or -not $sharedInclude) {
             throw 'Required Windows SDK include directories were not found.'
           }
 
@@ -66,8 +63,7 @@ jobs:
             '/D_AMD64_', '/DAMD64', '/D_X64_', '/D_WIN64', '/EHsc', '/W3', '/Zi',
             "/I$repoRoot",
             "/I$kmInclude",
-            "/I$sharedInclude",
-            "/I$umInclude"
+            "/I$sharedInclude"
           )
           if ($wdfInclude) { $args += "/I$wdfInclude" }
           $args += @("/Fo$obj", "/Tc$src")
