@@ -26,7 +26,7 @@ jobs:
             try {
               winget install --id $package --accept-source-agreements --accept-package-agreements --disable-interactivity --silent
             } catch {
-              Write-Host "Package install warning for $package: $($_.Exception.Message)"
+              Write-Host "Package install warning for ${package}: $($_.Exception.Message)"
             }
           }
 
