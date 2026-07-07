@@ -228,13 +228,14 @@ jobs:
             Write-Host "Warning: gmux.inf not found in repository root"
           }
 
-      - name: Sign driver .sys with test certificate
+      - name: Sign driver with test certificate (including CAT)
         shell: pwsh
         run: |
           $repoRoot = if ($env:GITHUB_WORKSPACE) { $env:GITHUB_WORKSPACE } else { (Get-Location).Path }
           $buildDir = Join-Path $repoRoot 'build'
           $sys = Join-Path $buildDir 'GmuxDriver.sys'
           $inf = Join-Path $buildDir 'gmux.inf'
+          $cat = Join-Path $buildDir 'GmuxDriver.cat'
 
           if (-not (Test-Path $sys)) { throw "Driver .sys not found at $sys" }
           if (-not (Test-Path $inf)) { throw "INF file not found at $inf" }
@@ -252,12 +253,33 @@ jobs:
             Write-Host "Using existing certificate: $($cert.Subject)"
           }
 
-          Write-Host "Signing driver .sys file with certificate: $($cert.Subject)"
+          # Ensure INF has CatalogFile entry (add if missing)
+          $infContent = Get-Content $inf
+          if ($infContent -notmatch "CatalogFile\s*=") {
+            Write-Host "Adding CatalogFile=GmuxDriver.cat to INF [Version] section..."
+            $infContent = $infContent -replace "(\[Version\][\r\n]+)", "`$1CatalogFile=GmuxDriver.cat`n"
+            Set-Content $inf $infContent
+          }
+
+          # Create catalog file (CAT)
+          Write-Host "Creating catalog file using inf2cat..."
+          & inf2cat /driver:$buildDir /os:10_X64 /verbose
+          if ($LASTEXITCODE -ne 0) { throw "inf2cat failed" }
+
+          if (-not (Test-Path $cat)) {
+            throw "CAT file not created: $cat"
+          }
+
+          # Sign the CAT file (and .sys for completeness)
+          Write-Host "Signing catalog file..."
+          & signtool sign /v /fd SHA256 /a /s My /n "$certName" /t http://timestamp.digicert.com $cat
+          if ($LASTEXITCODE -ne 0) { throw "signtool signing CAT failed" }
+
+          Write-Host "Signing .sys file..."
           & signtool sign /v /fd SHA256 /a /s My /n "$certName" /t http://timestamp.digicert.com $sys
           if ($LASTEXITCODE -ne 0) { throw "signtool signing .sys failed" }
 
-          Write-Host "INF file does not need signing. It will be used together with the signed .sys."
-          Write-Host "Driver .sys signed successfully."
+          Write-Host "Driver files signed successfully. CAT file created and signed."
 
           if (Test-Path "$env:TEMP\$certName.cer") {
             Copy-Item "$env:TEMP\$certName.cer" $buildDir -Force
@@ -282,4 +304,5 @@ jobs:
           path: |
             build/*.sys
             build/*.inf
+            build/*.cat
             build/*.cer
