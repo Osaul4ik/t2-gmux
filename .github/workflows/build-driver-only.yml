@@ -78,13 +78,77 @@ jobs:
             $libRoots = @($sdkLibRoot)
             $selectedLibs = @()
 
-            foreach ($name in @('wdfldr.sys.lib', 'WdfLdr.lib', 'ntoskrnl.lib', 'hal.lib')) {
-              $match = Get-ChildItem -Path $sdkLibRoot -Filter $name -Recurse -ErrorAction SilentlyContinue |
-                Select-Object -First 1
-              if ($match) {
-                $selectedLibs += $match.FullName
-                $libRoots += $match.DirectoryName
+            # Find the appropriate SDK version for x64
+            $sdkVersion = Get-ChildItem -Path $sdkLibRoot -Directory -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
+              Sort-Object Name -Descending |
+              Select-Object -First 1
+
+            if (-not $sdkVersion) {
+              throw 'Windows SDK version directory not found'
+            }
+
+            Write-Host "Using SDK version: $($sdkVersion.Name)"
+
+            # Define the architecture-specific paths
+            $archPaths = @(
+              "$sdkLibRoot\wdf\kmdf\x64",
+              "$sdkLibRoot\$($sdkVersion.Name)\km\x64",
+              "$sdkLibRoot\$($sdkVersion.Name)\um\x64"
+            )
+
+            foreach ($path in $archPaths) {
+              if (Test-Path $path) {
+                $libRoots += $path
+                Write-Host "Added library path: $path"
               }
+            }
+
+            # Look for specific libraries in the x64 paths
+            foreach ($name in @('wdfldr.sys.lib', 'WdfLdr.lib', 'ntoskrnl.lib', 'hal.lib')) {
+              foreach ($path in $archPaths) {
+                if (-not (Test-Path $path)) { continue }
+                $match = Get-ChildItem -Path $path -Filter $name -ErrorAction SilentlyContinue |
+                  Select-Object -First 1
+                if ($match) {
+                  $selectedLibs += $match.FullName
+                  Write-Host "Found $name at $($match.FullName)"
+                  break
+                }
+              }
+            }
+
+            # If we still don't have all libraries, try a broader search with architecture filter
+            if ($selectedLibs.Count -lt 4) {
+              Write-Host "Searching for missing libraries with broader x64 filter..."
+              foreach ($name in @('wdfldr.sys.lib', 'WdfLdr.lib', 'ntoskrnl.lib', 'hal.lib')) {
+                $match = Get-ChildItem -Path $sdkLibRoot -Filter $name -Recurse -ErrorAction SilentlyContinue |
+                  Where-Object { $_.FullName -match '\\x64\\' } |
+                  Select-Object -First 1
+                if ($match) {
+                  $selectedLibs += $match.FullName
+                  $libRoots += $match.DirectoryName
+                  Write-Host "Found $name at $($match.FullName) (fallback)"
+                }
+              }
+              $selectedLibs = $selectedLibs | Select-Object -Unique
+            }
+
+            # Add bufferoverflowU.lib for memset and other security functions
+            $bufferLib = Get-ChildItem -Path $sdkLibRoot -Filter 'bufferoverflowU.lib' -Recurse -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match '\\x64\\' } |
+              Select-Object -First 1
+            if ($bufferLib) {
+              $selectedLibs += $bufferLib.FullName
+              $libRoots += $bufferLib.DirectoryName
+              Write-Host "Found bufferoverflowU.lib at $($bufferLib.FullName)"
+            }
+
+            # Add MSVC runtime libraries for x64
+            $msvcLibPath = 'C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Tools\MSVC\14.44.35207\lib\x64'
+            if (Test-Path $msvcLibPath) {
+              $libRoots += $msvcLibPath
+              Write-Host "Added MSVC library path: $msvcLibPath"
             }
 
             $libArgs = $libRoots | Select-Object -Unique | Where-Object { Test-Path $_ } |
@@ -102,7 +166,12 @@ jobs:
         run: |
           $repoRoot = if ($env:GITHUB_WORKSPACE) { $env:GITHUB_WORKSPACE } else { (Get-Location).Path }
           $buildDir = Join-Path $repoRoot 'build'
-          Copy-Item "$repoRoot\gmux.inf" "$buildDir\gmux.inf" -Force
+          if (Test-Path "$repoRoot\gmux.inf") {
+            Copy-Item "$repoRoot\gmux.inf" "$buildDir\gmux.inf" -Force
+            Write-Host "Copied gmux.inf to build directory"
+          } else {
+            Write-Host "Warning: gmux.inf not found in repository root"
+          }
 
       - name: List generated files
         shell: pwsh
@@ -110,7 +179,11 @@ jobs:
           $repoRoot = if ($env:GITHUB_WORKSPACE) { $env:GITHUB_WORKSPACE } else { (Get-Location).Path }
           $buildDir = Join-Path $repoRoot 'build'
           Write-Output 'Generated files:'
-          Get-ChildItem -Path $buildDir -Recurse | Sort-Object FullName | ForEach-Object { $_.FullName }
+          if (Test-Path $buildDir) {
+            Get-ChildItem -Path $buildDir -Recurse | Sort-Object FullName | ForEach-Object { $_.FullName }
+          } else {
+            Write-Output 'Build directory not found'
+          }
 
       - name: Upload driver artifacts
         uses: actions/upload-artifact@v4
