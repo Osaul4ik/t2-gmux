@@ -34,16 +34,13 @@ jobs:
 
           if (-not (Test-Path $src)) { throw "driver.c not found at $src" }
 
-          $includeRoots = @(
-            $repoRoot,
-            'C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\km',
-            'C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared',
-            'C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um'
-          )
+          $kmInclude = 'C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\km'
+          $sharedInclude = 'C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\shared'
+          $umInclude = 'C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um'
 
-          $includeArgs = $includeRoots | ForEach-Object { '/I"' + $_ + '"' }
-          $args = @('/c','/nologo','/TC','/DWIN32','/D_WINDOWS','/D_KERNEL_MODE','/D_MBCS','/D_UNICODE','/EHsc','/W3','/Zi') + $includeArgs + @('/Fo' + $obj, $src)
-          & cl @args
+          $command = "cl /c /nologo /TC /DWIN32 /D_WINDOWS /D_KERNEL_MODE /D_MBCS /D_UNICODE /EHsc /W3 /Zi /I`"$repoRoot`" /I`"$kmInclude`" /I`"$sharedInclude`" /I`"$umInclude`" /Fo`"$obj`" /Tc`"$src`""
+          Write-Host $command
+          cmd /c $command
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Copy INF file
