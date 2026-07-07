@@ -38,15 +38,12 @@ jobs:
           cl /nologo /EHsc /W3 /DUNICODE /D_UNICODE .\gmux.cpp /I. /Fe"$buildDir\gmux_app.exe"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Copy build inputs
+      - name: Copy INF for packaging
         shell: pwsh
         run: |
           $repoRoot = if ($env:GITHUB_WORKSPACE) { $env:GITHUB_WORKSPACE } else { (Get-Location).Path }
           $buildDir = Join-Path $repoRoot 'build'
           Copy-Item "$repoRoot\gmux.inf" "$buildDir\gmux.inf" -Force
-          Copy-Item "$repoRoot\driver.c" "$buildDir\driver.c" -Force
-          Copy-Item "$repoRoot\public.h" "$buildDir\public.h" -Force
-          Copy-Item "$repoRoot\gmux.cpp" "$buildDir\gmux.cpp" -Force
 
       - name: List build output files
         shell: pwsh
@@ -63,8 +60,7 @@ jobs:
         with:
           name: gmux-driver-files
           path: |
-            build/gmux_app.exe
+            build/*.exe
+            build/*.dll
+            build/*.sys
             build/gmux.inf
-            build/driver.c
-            build/public.h
-            build/gmux.cpp
