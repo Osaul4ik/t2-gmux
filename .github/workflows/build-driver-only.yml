@@ -90,9 +90,21 @@ jobs:
 
             Write-Host "Using SDK version: $($sdkVersion.Name)"
 
+            # Find the latest KMDF version
+            $wdfVersion = Get-ChildItem -Path "$sdkLibRoot\wdf\kmdf" -Directory -ErrorAction SilentlyContinue |
+              Where-Object { $_.Name -match '^\d+\.\d+$' } |
+              Sort-Object { [version]$_.Name } -Descending |
+              Select-Object -First 1
+
+            if (-not $wdfVersion) {
+              throw 'KMDF version directory not found'
+            }
+
+            Write-Host "Using KMDF version: $($wdfVersion.Name)"
+
             # Define the architecture-specific paths
             $archPaths = @(
-              "$sdkLibRoot\wdf\kmdf\x64",
+              "$sdkLibRoot\wdf\kmdf\$($wdfVersion.Name)\x64",
               "$sdkLibRoot\$($sdkVersion.Name)\km\x64",
               "$sdkLibRoot\$($sdkVersion.Name)\um\x64"
             )
@@ -104,44 +116,53 @@ jobs:
               }
             }
 
-            # Look for specific libraries in the x64 paths
-            foreach ($name in @('wdfldr.sys.lib', 'WdfLdr.lib', 'ntoskrnl.lib', 'hal.lib')) {
-              foreach ($path in $archPaths) {
-                if (-not (Test-Path $path)) { continue }
-                $match = Get-ChildItem -Path $path -Filter $name -ErrorAction SilentlyContinue |
-                  Select-Object -First 1
-                if ($match) {
-                  $selectedLibs += $match.FullName
-                  Write-Host "Found $name at $($match.FullName)"
-                  break
-                }
+            # Add WDF library - this is the correct one for KMDF
+            $wdfLibPath = "$sdkLibRoot\wdf\kmdf\$($wdfVersion.Name)\x64"
+            if (Test-Path $wdfLibPath) {
+              # Look for WdfLdr.lib in the KMDF path
+              $wdfLdr = Get-ChildItem -Path $wdfLibPath -Filter 'WdfLdr.lib' -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+              if ($wdfLdr) {
+                $selectedLibs += $wdfLdr.FullName
+                Write-Host "Found WdfLdr.lib at $($wdfLdr.FullName)"
+              }
+
+              # Also add WdfDriverEntry.lib if it exists (needed for KMDF)
+              $wdfDriverEntry = Get-ChildItem -Path $wdfLibPath -Filter 'WdfDriverEntry.lib' -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+              if ($wdfDriverEntry) {
+                $selectedLibs += $wdfDriverEntry.FullName
+                Write-Host "Found WdfDriverEntry.lib at $($wdfDriverEntry.FullName)"
               }
             }
 
-            # If we still don't have all libraries, try a broader search with architecture filter
-            if ($selectedLibs.Count -lt 4) {
-              Write-Host "Searching for missing libraries with broader x64 filter..."
-              foreach ($name in @('wdfldr.sys.lib', 'WdfLdr.lib', 'ntoskrnl.lib', 'hal.lib')) {
-                $match = Get-ChildItem -Path $sdkLibRoot -Filter $name -Recurse -ErrorAction SilentlyContinue |
-                  Where-Object { $_.FullName -match '\\x64\\' } |
-                  Select-Object -First 1
-                if ($match) {
-                  $selectedLibs += $match.FullName
-                  $libRoots += $match.DirectoryName
-                  Write-Host "Found $name at $($match.FullName) (fallback)"
-                }
+            # Add standard kernel libraries
+            $kernelLibs = @('ntoskrnl.lib', 'hal.lib')
+            foreach ($name in $kernelLibs) {
+              $match = Get-ChildItem -Path "$sdkLibRoot\$($sdkVersion.Name)\km\x64" -Filter $name -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+              if ($match) {
+                $selectedLibs += $match.FullName
+                Write-Host "Found $name at $($match.FullName)"
               }
-              $selectedLibs = $selectedLibs | Select-Object -Unique
             }
 
             # Add bufferoverflowU.lib for memset and other security functions
-            $bufferLib = Get-ChildItem -Path $sdkLibRoot -Filter 'bufferoverflowU.lib' -Recurse -ErrorAction SilentlyContinue |
-              Where-Object { $_.FullName -match '\\x64\\' } |
+            $bufferLib = Get-ChildItem -Path "$sdkLibRoot\$($sdkVersion.Name)\um\x64" -Filter 'bufferoverflowU.lib' -ErrorAction SilentlyContinue |
               Select-Object -First 1
             if ($bufferLib) {
               $selectedLibs += $bufferLib.FullName
-              $libRoots += $bufferLib.DirectoryName
               Write-Host "Found bufferoverflowU.lib at $($bufferLib.FullName)"
+            } else {
+              # Try fallback location
+              $bufferLib = Get-ChildItem -Path $sdkLibRoot -Filter 'bufferoverflowU.lib' -Recurse -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match '\\x64\\' } |
+                Select-Object -First 1
+              if ($bufferLib) {
+                $selectedLibs += $bufferLib.FullName
+                $libRoots += $bufferLib.DirectoryName
+                Write-Host "Found bufferoverflowU.lib at $($bufferLib.FullName) (fallback)"
+              }
             }
 
             # Add MSVC runtime libraries for x64
