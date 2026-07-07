@@ -83,9 +83,9 @@ jobs:
             '/DWIN32', '/D_WINDOWS', '/D_KERNEL_MODE', '/D_MBCS', '/D_UNICODE',
             '/D_AMD64_', '/DAMD64', '/D_X64_', '/D_WIN64',
             '/W3', '/Zi',
-            '/GS-',  # Disable security cookies
-            '/Gz',   # __stdcall
-            '/Zl',   # Omit default library names
+            '/GS-',
+            '/Gz',
+            '/Zl',
             "/I$repoRoot",
             "/I$kmInclude",
             "/I$sharedInclude"
@@ -97,7 +97,7 @@ jobs:
           & cl @driverArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-          # Compile stub.c (no includes needed)
+          # Compile stub.c
           $stubArgs = @('/c', '/nologo', '/TC', '/GS-', '/Zl', "/Fo$stubObj", "/Tc$stubSrc")
           Write-Host "cl $($stubArgs -join ' ')"
           & cl @stubArgs
@@ -108,7 +108,6 @@ jobs:
             $libRoots = @()
             $selectedLibs = @()
 
-            # Find the appropriate SDK version
             $sdkVersion = Get-ChildItem -Path $sdkLibRoot -Directory -ErrorAction SilentlyContinue |
               Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
               Sort-Object Name -Descending |
@@ -126,7 +125,6 @@ jobs:
               Write-Host "Added kernel library path: $kernelLibPath"
             }
 
-            # Find WDF libraries
             $wdfPaths = @(
               "$sdkLibRoot\wdf\kmdf\x64",
               "$sdkLibRoot\wdf\kmdf"
@@ -157,7 +155,6 @@ jobs:
               }
             }
 
-            # Fallback search
             if (-not $wdfFound) {
               Write-Host "Searching for WDF libraries in all locations..."
               $wdfLdr = Get-ChildItem -Path $sdkLibRoot -Filter 'WdfLdr.lib' -Recurse -ErrorAction SilentlyContinue |
@@ -178,7 +175,6 @@ jobs:
               }
             }
 
-            # Add kernel libraries
             $kernelLibs = @('ntoskrnl.lib', 'hal.lib')
             foreach ($name in $kernelLibs) {
               $match = Get-ChildItem -Path $kernelLibPath -Filter $name -ErrorAction SilentlyContinue |
@@ -189,7 +185,6 @@ jobs:
               }
             }
 
-            # Remove duplicates
             $libRoots = $libRoots | Select-Object -Unique | Where-Object { Test-Path $_ }
             $selectedLibs = $selectedLibs | Select-Object -Unique
 
@@ -208,8 +203,7 @@ jobs:
               '/IGNORE:4086',
               '/IGNORE:4254',
               '/MERGE:_PAGE=PAGE',
-              '/MERGE:_TEXT=.text',
-              '/SECTION:INIT,d'
+              '/MERGE:_TEXT=.text'
             ) + $libArgs + @($obj, $stubObj) + $selectedLibs
 
             Write-Host "link $($linkArgs -join ' ')"
@@ -229,44 +223,39 @@ jobs:
             Write-Host "Warning: gmux.inf not found in repository root"
           }
 
-      - name: Create test certificate and sign driver
+      - name: Sign driver with test certificate
         shell: pwsh
         run: |
           $repoRoot = if ($env:GITHUB_WORKSPACE) { $env:GITHUB_WORKSPACE } else { (Get-Location).Path }
           $buildDir = Join-Path $repoRoot 'build'
-          $certPath = Join-Path $buildDir 'testcert.cer'
-          $pfxPath = Join-Path $buildDir 'testcert.pfx'
+          $sys = Join-Path $buildDir 'GmuxDriver.sys'
+          $inf = Join-Path $buildDir 'gmux.inf'
 
-          # Create a self-signed certificate for testing
-          Write-Host "Creating test certificate..."
-          & makecert -r -pe -ss PrivateCertStore -n "CN=Test Driver Certificate" -eku 1.3.6.1.5.5.7.3.3 $certPath
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path $sys)) { throw "Driver .sys not found at $sys" }
+          if (-not (Test-Path $inf)) { throw "INF file not found at $inf" }
 
-          # Convert to PFX for signing
-          & pvk2pfx -pvk (Join-Path $buildDir 'testcert.pvk') -spc $certPath -pfx $pfxPath -pi password
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          # Sign the driver files
-          Write-Host "Signing driver files..."
-          $filesToSign = @(
-            (Join-Path $buildDir 'GmuxDriver.sys'),
-            (Join-Path $buildDir 'gmux.inf')
-          )
-
-          foreach ($file in $filesToSign) {
-            if (Test-Path $file) {
-              Write-Host "Signing $file"
-              & signtool sign /f $pfxPath /p password /fd SHA256 /v $file
-              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-            } else {
-              Write-Host "Warning: $file not found"
-            }
+          $certName = "TestGmuxDriverCert"
+          # Перевіряємо, чи вже існує сертифікат
+          $cert = Get-ChildItem -Path Cert:\CurrentUser\My | Where-Object { $_.Subject -like "*$certName*" } | Select-Object -First 1
+          if (-not $cert) {
+            Write-Host "Creating test certificate..."
+            & makecert -r -pe -ss My -n "CN=$certName" -eku 1.3.6.1.5.5.7.3.3 -sv "$env:TEMP\$certName.pvk" "$env:TEMP\$certName.cer"
+            if ($LASTEXITCODE -ne 0) { throw "makecert failed" }
+            & certutil -user -addstore Root "$env:TEMP\$certName.cer"
+            if ($LASTEXITCODE -ne 0) { throw "certutil add to Root failed" }
+            $cert = Get-ChildItem -Path Cert:\CurrentUser\My | Where-Object { $_.Subject -like "*$certName*" } | Select-Object -First 1
+            if (-not $cert) { throw "Failed to retrieve certificate" }
           }
 
-          # Verify signature
-          Write-Host "Verifying signatures..."
-          & signtool verify /pa /v $sys
-          if ($LASTEXITCODE -ne 0) { Write-Host "Verification failed, but continuing..." }
+          Write-Host "Signing driver files with certificate: $($cert.Subject)"
+          & signtool sign /v /fd SHA256 /a /sm /s My /n "$certName" /t http://timestamp.digicert.com $sys
+          if ($LASTEXITCODE -ne 0) { throw "signtool signing sys failed" }
+          & signtool sign /v /fd SHA256 /a /sm /s My /n "$certName" /t http://timestamp.digicert.com $inf
+          if ($LASTEXITCODE -ne 0) { throw "signtool signing inf failed" }
+
+          Write-Host "Driver files signed successfully."
+          # Копіюємо .cer у папку build
+          Copy-Item "$env:TEMP\$certName.cer" $buildDir -Force
 
       - name: List generated files
         shell: pwsh
@@ -287,3 +276,4 @@ jobs:
           path: |
             build/*.sys
             build/*.inf
+            build/*.cer
