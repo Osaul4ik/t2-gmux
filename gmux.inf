@@ -1,0 +1,41 @@
+; GmuxDriver.inf
+; Root-enumerated встановлення (пристрій не прив'язаний до PCI/USB — це не
+; фізичний Plug-and-Play пристрій, а "віртуальний" вузол для доступу до MMIO).
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=System
+ClassGuid={4D36E97D-E325-11CE-BFC1-08002BE10318}
+Provider=%ManufacturerName%
+CatalogFile=GmuxDriver.cat
+DriverVer=
+
+[Manufacturer]
+%ManufacturerName%=Standard,NTamd64
+
+[Standard.NTamd64]
+%DeviceDesc%=GmuxDriver_Device, root\GmuxDriver
+
+[GmuxDriver_Device.NT]
+CopyFiles=Drivers_Dir
+
+[Drivers_Dir]
+GmuxDriver.sys
+
+[GmuxDriver_Device.NT.Services]
+AddService = GmuxDriver,0x000001fa,GmuxDriver_Service_Inst
+
+[GmuxDriver_Service_Inst]
+DisplayName    = %ServiceDesc%
+ServiceType    = 1
+StartType      = 3
+ErrorControl   = 1
+ServiceBinary  = %12%\GmuxDriver.sys
+
+[DestinationDirs]
+Drivers_Dir = 12
+
+[Strings]
+ManufacturerName = "Homebrew"
+DeviceDesc = "Apple GMUX Control Device"
+ServiceDesc = "GMUX Control Service"
