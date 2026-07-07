@@ -24,12 +24,15 @@ jobs:
 
       - name: Create driver build files
         run: |
-          if (-not (Test-Path build)) { New-Item -ItemType Directory -Path build | Out-Null }
-          Set-Location build
-          $inf = Join-Path $PSScriptRoot 'gmux.inf'
-          $src = Join-Path $PSScriptRoot 'driver.c'
-          $hdr = Join-Path $PSScriptRoot 'public.h'
+          $repoRoot = if ($env:GITHUB_WORKSPACE) { $env:GITHUB_WORKSPACE } else { (Get-Location).Path }
+          if (-not (Test-Path (Join-Path $repoRoot 'build'))) { New-Item -ItemType Directory -Path (Join-Path $repoRoot 'build') | Out-Null }
+          Set-Location (Join-Path $repoRoot 'build')
+          $inf = Join-Path $repoRoot 'gmux.inf'
+          $src = Join-Path $repoRoot 'driver.c'
+          $hdr = Join-Path $repoRoot 'public.h'
           if (-not (Test-Path $inf)) { Write-Error 'gmux.inf not found'; exit 1 }
+          if (-not (Test-Path $src)) { Write-Error 'driver.c not found'; exit 1 }
+          if (-not (Test-Path $hdr)) { Write-Error 'public.h not found'; exit 1 }
           $content = @"
           [version]
           Signature="$WINDOWS NT$"
