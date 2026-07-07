@@ -74,7 +74,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           if (Test-Path $obj) {
-            $linkArgs = @('/NOLOGO', '/DRIVER', '/SUBSYSTEM:NATIVE', '/ENTRY:DriverEntry', "/OUT:$sys", $obj)
+            $libRoots = @(
+              'C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\km\x64',
+              'C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\um\x64',
+              'C:\Program Files (x86)\Windows Kits\10\Lib\wdf\kmdf\1.9\x64'
+            )
+            $libArgs = $libRoots | Where-Object { Test-Path $_ } | ForEach-Object { '/LIBPATH:"' + $_ + '"' }
+            $linkArgs = @('/NOLOGO', '/DRIVER', '/SUBSYSTEM:NATIVE', '/ENTRY:DriverEntry', "/OUT:$sys") + $libArgs + @($obj, 'ntoskrnl.lib', 'hal.lib', 'wdfldr.sys.lib')
             Write-Host "link $($linkArgs -join ' ')"
             & link @linkArgs
           }
