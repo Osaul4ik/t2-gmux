@@ -268,10 +268,17 @@ ApplyDefaultRoute(_In_ PUCHAR Base, _In_ UCHAR Route)
                             current == GMUX_ROUTE_IGD  ? "iGPU" : "?") : "<read failed>");
 
     if (Route == GMUX_ROUTE_DGPU) {
-        // The rail state cannot be read back (Linux never reads port 0x50), so power the
-        // dGPU on unconditionally: a previous session may have left it off with the route
-        // still pointing at the iGPU. GmuxSwitchTo(TRUE) = rail on, then route.
-        GmuxSwitchTo(Base, TRUE);
+        // Only power-cycle + re-route when the panel is not already on the dGPU. The rail
+        // state itself still can't be read back (Linux never reads port 0x50), so if the
+        // route says something other than dGPU we still go through GmuxSwitchTo(TRUE) to be
+        // safe (rail may have been left off by a previous session). But if the route already
+        // reads dGPU, the panel link is presumably already up and live - forcing another
+        // power-rail toggle + route write here (right as the boot logo's framebuffer is live,
+        // before the real GPU driver has loaded to retrain the link) is what causes the
+        // black-screen-after-logo symptom. Skip it in that case.
+        if (!haveCurrent || current != GMUX_ROUTE_DGPU) {
+            GmuxSwitchTo(Base, TRUE);
+        }
     } else if (Route == GMUX_ROUTE_IGD) {
         // Route only - never cut the rail at boot.
         if (!haveCurrent || current != GMUX_ROUTE_IGD) {

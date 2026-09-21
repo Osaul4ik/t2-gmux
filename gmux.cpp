@@ -316,6 +316,18 @@ static int CmdToRadeon(HANDLE h)
 {
     printf("== switch to Radeon ==\n");
 
+    // Idempotency check: if the panel is already routed to a live Radeon, running the full
+    // sequence again (power rail bounce + PCI rescan + route write) has no benefit and can
+    // itself drop the panel link with nothing left to retrain it. Bail out early instead.
+    UCHAR curRoute = 0;
+    GpuInfo amdNow;
+    if (Read8(h, GMUX_PORT_SWITCH_GET_DISPLAY, &curRoute) && curRoute == GMUX_ROUTE_DGPU &&
+        QueryGpu(VEN_AMD, &amdNow) && GpuRunning(amdNow)) {
+        printf("  already routed to Radeon and it is running - nothing to do.\n");
+        CmdStatus(h);
+        return 0;
+    }
+
     if (!Power(h, true)) { printf("ABORT: dGPU power-on failed; panel left where it was.\n"); return 1; }
     Sleep(500);
     RescanPci();
@@ -336,6 +348,13 @@ static int CmdToRadeon(HANDLE h)
     }
 
     if (!Route(h, true)) { printf("FAILED: route to dGPU failed.\n"); return 1; }
+
+    // A plain route write does not guarantee the eDP link gets retrained on this hardware -
+    // CmdTrial already relies on bouncing the adapter in PnP to force that for Intel; do the
+    // same for Radeon here so the panel doesn't stay black after a successful route switch.
+    printf("  restarting Radeon adapter so it re-detects the panel ...\n");
+    if (SetGpuState(VEN_AMD, DICS_DISABLE)) WaitGpu(VEN_AMD, true, 8000);
+    if (SetGpuState(VEN_AMD, DICS_ENABLE))  WaitGpu(VEN_AMD, false, 15000);
 
     printf("== done ==\n");
     CmdStatus(h);
