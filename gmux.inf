@@ -1,5 +1,6 @@
-; GmuxDriver.inf - root-enumerated KMDF driver used to reach the Apple gmux MMIO
-; block on T2 Macs (not a physical PnP device - a virtual node).
+; GmuxDriver.inf - KMDF driver used to reach the Apple gmux MMIO block on T2 Macs.
+; Binds to the ACPI\APP000B node (address taken from its ACPI resource); the old
+; root-enumerated virtual node root\GmuxDriver is still listed as a fallback.
 ;
 ; $ARCH$, $KMDFVERSION$ and the DriverVer line are rewritten by CI (StampInf).
 ; Keep this file pure ASCII: non-ASCII bytes in INF comments have caused
@@ -28,7 +29,12 @@ GmuxDriver.sys = 1,,
 %ManufacturerName% = Standard,NT$ARCH$.10.0...16299
 
 [Standard.NT$ARCH$.10.0...16299]
-%DeviceDesc% = GmuxDriver_Device, root\GmuxDriver
+; Real ACPI node first: PnP then hands the driver the gmux memory range from
+; ACPI _CRS (read in EvtDevicePrepareHardware). The root\ ID is kept only for the
+; old virtual-node install; do NOT create both nodes at once (they share
+; \Device\GmuxCtl and the same MMIO block).
+%DeviceDesc%     = GmuxDriver_Device, ACPI\APP000B
+%DeviceDescRoot% = GmuxDriver_Device, root\GmuxDriver
 
 [Drivers_Dir]
 GmuxDriver.sys
@@ -58,4 +64,5 @@ SPSVCINST_ASSOCSERVICE = 0x00000002
 ManufacturerName       = "Osaul4ik"
 DiskName               = "Gmux Driver Installation Disk"
 DeviceDesc             = "Apple GMUX Control Device"
+DeviceDescRoot         = "Apple GMUX Control Device (root-enumerated)"
 ServiceDesc            = "GMUX Control Service"

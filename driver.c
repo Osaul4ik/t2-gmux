@@ -1,5 +1,13 @@
 // driver.c - KMDF driver for Apple gmux access on T2 Mac (MMIO variant).
-// Maps 16 bytes at 0xFE0B0200. Protocol taken from Linux drivers/platform/x86/apple-gmux.c.
+// Protocol taken from Linux drivers/platform/x86/apple-gmux.c.
+//
+// Physical address: like Linux (pnp_get_resource(IORESOURCE_MEM, 0)), the base is
+// taken from the memory resource the ACPI node ACPI\APP000B hands to the driver
+// in EvtDevicePrepareHardware - it is NOT guessed. Also like Linux, 16 bytes are
+// mapped even though ACPI declares only 8 (the extra 8 are never claimed by PnP;
+// MmMapIoSpaceEx does not go through the resource arbiter). GMUX_FALLBACK_PHYS_BASE
+// is used only when the device node has no memory resource at all (root-enumerated
+// install, root\GmuxDriver).
 //
 // Adds, versus the original raw read/write-only version:
 //   - GmuxSetDiscretePower(): mirrors gmux_set_discrete_state() - two-write
@@ -19,8 +27,10 @@
 #include "public.h"
 
 // ---- Hardware base ----
-#define GMUX_PHYS_BASE   0xFE0B0200
-#define GMUX_MMIO_SIZE   16
+// Only used for a root-enumerated node that has no ACPI resource. Normal path:
+// the address comes from EvtDevicePrepareHardware.
+#define GMUX_FALLBACK_PHYS_BASE  0xFE0B0200
+#define GMUX_MMIO_SIZE           16   // Linux maps 16 although ACPI declares 8
 
 #define OFF_DATA         0x00
 #define OFF_PORT_SELECT  0x0E
@@ -30,6 +40,7 @@
 typedef struct _DEVICE_CONTEXT {
     PUCHAR  MappedBase;
     BOOLEAN Mapped;
+    BOOLEAN ForceIgdApplied;
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetDeviceContext)
@@ -38,6 +49,8 @@ WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetDeviceContext)
 DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD EvtDeviceAdd;
 EVT_WDF_OBJECT_CONTEXT_CLEANUP EvtDeviceContextCleanup;
+EVT_WDF_DEVICE_PREPARE_HARDWARE EvtDevicePrepareHardware;
+EVT_WDF_DEVICE_RELEASE_HARDWARE EvtDeviceReleaseHardware;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL EvtIoDeviceControl;
 
 // Prototypes carry the same SAL annotations as the definitions - PREfast (C28301)
@@ -48,7 +61,6 @@ static BOOLEAN GmuxWrite8(_In_ PUCHAR Base, _In_ UCHAR Port, _In_ UCHAR Value);
 static BOOLEAN GmuxSetDiscretePower(_In_ PUCHAR Base, _In_ BOOLEAN PowerOn, _In_ ULONG SettleMs);
 static BOOLEAN GmuxSwitchDisplayRoute(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete);
 static BOOLEAN GmuxSwitchTo(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete);
-static NTSTATUS EnsureMapped(_In_ PDEVICE_CONTEXT Context);
 static BOOLEAN GmuxDetect(_In_ PUCHAR Base);
 static ULONG   ReadForceIgdSetting(_In_ WDFDRIVER Driver);
 
@@ -141,36 +153,6 @@ GmuxSwitchTo(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete)
     return ok;
 }
 
-// ---- MMIO mapping (deferred until first IOCTL) ----
-static NTSTATUS
-EnsureMapped(_In_ PDEVICE_CONTEXT Context)
-{
-    if (Context->Mapped) {
-        return STATUS_SUCCESS;
-    }
-
-    PHYSICAL_ADDRESS physAddr;
-    physAddr.QuadPart = GMUX_PHYS_BASE;
-
-    Context->MappedBase = (PUCHAR)MmMapIoSpaceEx(physAddr, GMUX_MMIO_SIZE,
-                                                 PAGE_READWRITE | PAGE_NOCACHE);
-    if (Context->MappedBase == NULL) {
-        DbgPrint("[Gmux] MmMapIoSpace failed\n");
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
-    if (!GmuxDetect(Context->MappedBase)) {
-        DbgPrint("[Gmux] Detect failed - wrong address or hardware not present\n");
-        MmUnmapIoSpace(Context->MappedBase, GMUX_MMIO_SIZE);
-        Context->MappedBase = NULL;
-        return STATUS_DEVICE_NOT_CONNECTED;
-    }
-
-    Context->Mapped = TRUE;
-    DbgPrint("[Gmux] MMIO mapped successfully, version check passed\n");
-    return STATUS_SUCCESS;
-}
-
 // ---- Version check (port 0x04) ----
 static BOOLEAN
 GmuxDetect(_In_ PUCHAR Base)
@@ -222,15 +204,116 @@ EvtDeviceContextCleanup(_In_ WDFOBJECT Object)
 {
     WDFDEVICE device = (WDFDEVICE)Object;
     PDEVICE_CONTEXT context = GetDeviceContext(device);
+    // Safety net only: EvtDeviceReleaseHardware normally unmaps first.
+    if (context->Mapped && context->MappedBase != NULL) {
+        MmUnmapIoSpace(context->MappedBase, GMUX_MMIO_SIZE);
+        context->MappedBase = NULL;
+        context->Mapped = FALSE;
+        DbgPrint("[Gmux] MMIO unmapped (cleanup)\n");
+    }
+}
+
+// ---- Resources: map the MMIO block the ACPI node assigned to us ----
+// Mirrors Linux gmux_probe(): res = pnp_get_resource(pnp, IORESOURCE_MEM, 0);
+// then a 16-byte mapping starting at res->start.
+NTSTATUS
+EvtDevicePrepareHardware(
+    _In_ WDFDEVICE Device,
+    _In_ WDFCMRESLIST ResourcesRaw,
+    _In_ WDFCMRESLIST ResourcesTranslated)
+{
+    UNREFERENCED_PARAMETER(ResourcesRaw);
+
+    PDEVICE_CONTEXT context = GetDeviceContext(Device);
+    PHYSICAL_ADDRESS physAddr;
+    BOOLEAN fromAcpi = FALSE;
+    ULONG declaredLen = 0;
+    ULONG count = 0;
+    ULONG i;
+
+    physAddr.QuadPart = 0;
+
+    if (ResourcesTranslated != NULL) {   // a root-enumerated node may have no resource list
+        count = WdfCmResourceListGetCount(ResourcesTranslated);
+    }
+
+    for (i = 0; i < count; i++) {
+        PCM_PARTIAL_RESOURCE_DESCRIPTOR desc =
+            WdfCmResourceListGetDescriptor(ResourcesTranslated, i);
+        if (desc == NULL) {
+            continue;
+        }
+        if (desc->Type == CmResourceTypeMemory) {
+            physAddr = desc->u.Memory.Start;
+            declaredLen = desc->u.Memory.Length;
+            fromAcpi = TRUE;
+            break;   // resource index 0 of type MEM, like Linux
+        }
+        if (desc->Type == CmResourceTypePort) {
+            // Classic/indexed (pre-T2) gmux uses I/O ports; this driver only
+            // implements the T2 MMIO protocol.
+            DbgPrint("[Gmux] I/O-port gmux resource found - not supported by this driver\n");
+        }
+    }
+
+    if (!fromAcpi) {
+        physAddr.QuadPart = GMUX_FALLBACK_PHYS_BASE;
+        DbgPrint("[Gmux] No memory resource from PnP (root-enumerated?), using fallback 0x%llX\n",
+                 (ULONGLONG)physAddr.QuadPart);
+    } else {
+        DbgPrint("[Gmux] ACPI memory resource: base=0x%llX declared_len=%lu (mapping %d)\n",
+                 (ULONGLONG)physAddr.QuadPart, declaredLen, GMUX_MMIO_SIZE);
+    }
+
+    context->MappedBase = (PUCHAR)MmMapIoSpaceEx(physAddr, GMUX_MMIO_SIZE,
+                                                 PAGE_READWRITE | PAGE_NOCACHE);
+    if (context->MappedBase == NULL) {
+        DbgPrint("[Gmux] MmMapIoSpaceEx failed\n");
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    if (!GmuxDetect(context->MappedBase)) {
+        DbgPrint("[Gmux] Detect failed - not a gmux at this address\n");
+        MmUnmapIoSpace(context->MappedBase, GMUX_MMIO_SIZE);
+        context->MappedBase = NULL;
+        return STATUS_DEVICE_NOT_CONNECTED;
+    }
+
+    context->Mapped = TRUE;
+    DbgPrint("[Gmux] MMIO mapped, version check passed\n");
+
+    // ForceIGD-on-load, mirroring Linux apple_gmux.force_igd=1. Uses the full
+    // sequenced GmuxSwitchTo(), never a raw display-route-only write. Applied
+    // once per device object, not again on a PnP stop/start rebalance.
+    if (!context->ForceIgdApplied) {
+        context->ForceIgdApplied = TRUE;
+        if (ReadForceIgdSetting(WdfGetDriver())) {
+            GmuxSwitchTo(context->MappedBase, FALSE);   // FALSE = route to iGPU
+            DbgPrint("[Gmux] ForceIGD applied at load\n");
+        }
+    }
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS
+EvtDeviceReleaseHardware(
+    _In_ WDFDEVICE Device,
+    _In_ WDFCMRESLIST ResourcesTranslated)
+{
+    UNREFERENCED_PARAMETER(ResourcesTranslated);
+
+    PDEVICE_CONTEXT context = GetDeviceContext(Device);
     if (context->Mapped && context->MappedBase != NULL) {
         MmUnmapIoSpace(context->MappedBase, GMUX_MMIO_SIZE);
         context->MappedBase = NULL;
         context->Mapped = FALSE;
         DbgPrint("[Gmux] MMIO unmapped\n");
     }
+    return STATUS_SUCCESS;
 }
 
-// ---- Device creation + ForceIGD-on-load ----
+// ---- Device creation ----
 NTSTATUS
 EvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
 {
@@ -240,6 +323,9 @@ EvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
     WDF_IO_QUEUE_CONFIG queueConfig;
     WDFQUEUE queue;
     PDEVICE_CONTEXT context;
+    WDF_PNPPOWER_EVENT_CALLBACKS pnpCallbacks;
+
+    UNREFERENCED_PARAMETER(Driver);
 
     UNICODE_STRING symbolicLinkName;
     RtlInitUnicodeString(&symbolicLinkName, L"\\DosDevices\\GmuxCtl");
@@ -254,6 +340,12 @@ EvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
     DECLARE_CONST_UNICODE_STRING(sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)"); // SYSTEM + Administrators only
     status = WdfDeviceInitAssignSDDLString(DeviceInit, &sddl);
     if (!NT_SUCCESS(status)) return status;
+
+    // Hardware resources (ACPI\APP000B memory range) arrive here, not in EvtDeviceAdd.
+    WDF_PNPPOWER_EVENT_CALLBACKS_INIT(&pnpCallbacks);
+    pnpCallbacks.EvtDevicePrepareHardware = EvtDevicePrepareHardware;
+    pnpCallbacks.EvtDeviceReleaseHardware = EvtDeviceReleaseHardware;
+    WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnpCallbacks);
 
     WdfDeviceInitSetDeviceType(DeviceInit, FILE_DEVICE_UNKNOWN);
     WdfDeviceInitSetCharacteristics(DeviceInit, FILE_DEVICE_SECURE_OPEN, FALSE);
@@ -270,6 +362,7 @@ EvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
     context = GetDeviceContext(device);
     context->MappedBase = NULL;
     context->Mapped = FALSE;
+    context->ForceIgdApplied = FALSE;
 
     WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchSequential);
     queueConfig.EvtIoDeviceControl = EvtIoDeviceControl;
@@ -277,17 +370,7 @@ EvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
     status = WdfIoQueueCreate(device, &queueConfig, WDF_NO_OBJECT_ATTRIBUTES, &queue);
     if (!NT_SUCCESS(status)) return status;
 
-    // ForceIGD-on-load, mirroring Linux apple_gmux.force_igd=1. Uses the
-    // full sequenced GmuxSwitchTo(), not a raw display-route-only write.
-    if (NT_SUCCESS(EnsureMapped(context)) && context->MappedBase != NULL) {
-        ULONG forceIgd = ReadForceIgdSetting(Driver);
-        if (forceIgd) {
-            GmuxSwitchTo(context->MappedBase, FALSE); // FALSE = route to iGPU
-            DbgPrint("[Gmux] ForceIGD applied at load\n");
-        }
-    } else {
-        DbgPrint("[Gmux] Device added, MMIO mapping deferred/failed at load\n");
-    }
+    // MMIO mapping and ForceIGD happen in EvtDevicePrepareHardware.
 
     return STATUS_SUCCESS;
 }
@@ -309,10 +392,8 @@ EvtIoDeviceControl(
     PDEVICE_CONTEXT context = GetDeviceContext(device);
     size_t bytesReturned = 0;
 
-    status = EnsureMapped(context);
-    if (!NT_SUCCESS(status) || context->MappedBase == NULL) {
-        WdfRequestCompleteWithInformation(Request,
-                                          NT_SUCCESS(status) ? STATUS_DEVICE_NOT_CONNECTED : status, 0);
+    if (!context->Mapped || context->MappedBase == NULL) {
+        WdfRequestCompleteWithInformation(Request, STATUS_DEVICE_NOT_READY, 0);
         return;
     }
 
