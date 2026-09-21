@@ -1,48 +1,61 @@
-; GmuxDriver.inf
-; Root-enumerated встановлення (пристрій не прив'язаний до PCI/USB — це не
-; фізичний Plug-and-Play пристрій, а "віртуальний" вузол для доступу до MMIO).
+; GmuxDriver.inf - root-enumerated KMDF driver used to reach the Apple gmux MMIO
+; block on T2 Macs (not a physical PnP device - a virtual node).
+;
+; $ARCH$, $KMDFVERSION$ and the DriverVer line are rewritten by CI (StampInf).
+; Keep this file pure ASCII: non-ASCII bytes in INF comments have caused
+; parser/InfVerif problems before.
 
 [Version]
-Signature="$WINDOWS NT$"
-Class=System
-ClassGuid={4D36E97D-E325-11CE-BFC1-08002BE10318}
-Provider=%ManufacturerName%
-CatalogFile=GmuxDriver.cat
-DriverVer=07/07/2026,1.0.0.0
-
-[Manufacturer]
-%ManufacturerName%=Standard,NTamd64
-
-[Standard.NTamd64]
-%DeviceDesc%=GmuxDriver_Device, root\GmuxDriver
-
-[GmuxDriver_Device.NT]
-CopyFiles=Drivers_Dir
-
-[Drivers_Dir]
-GmuxDriver.sys
-
-[GmuxDriver_Device.NT.Services]
-AddService = GmuxDriver,0x000001fa,GmuxDriver_Service_Inst
-
-[GmuxDriver_Service_Inst]
-DisplayName    = %ServiceDesc%
-ServiceType    = 1
-StartType      = 3
-ErrorControl   = 1
-ServiceBinary  = %12%\GmuxDriver.sys
+Signature   = "$WINDOWS NT$"
+Class       = System
+ClassGuid   = {4D36E97D-E325-11CE-BFC1-08002BE10318}
+Provider    = %ManufacturerName%
+CatalogFile = GmuxDriver.cat
+DriverVer   = 01/01/2026,1.0.0.0
+PnpLockdown = 1
 
 [DestinationDirs]
-Drivers_Dir = 12
+DefaultDestDir = 13
+Drivers_Dir    = 13
 
-; Додаємо SourceDisksNames щоб уникнути помилки 22.9.11
 [SourceDisksNames]
-1 = "Gmux Driver Disk",,,
+1 = %DiskName%,,,""
 
 [SourceDisksFiles]
 GmuxDriver.sys = 1,,
 
+[Manufacturer]
+%ManufacturerName% = Standard,NT$ARCH$
+
+[Standard.NT$ARCH$]
+%DeviceDesc% = GmuxDriver_Device, root\GmuxDriver
+
+[Drivers_Dir]
+GmuxDriver.sys
+
+[GmuxDriver_Device.NT]
+CopyFiles = Drivers_Dir
+
+[GmuxDriver_Device.NT.Services]
+AddService = GmuxDriver, %SPSVCINST_ASSOCSERVICE%, GmuxDriver_Service_Inst
+
+[GmuxDriver_Service_Inst]
+DisplayName   = %ServiceDesc%
+ServiceType   = 1               ; SERVICE_KERNEL_DRIVER
+StartType     = 3               ; SERVICE_DEMAND_START
+ErrorControl  = 1               ; SERVICE_ERROR_NORMAL
+ServiceBinary = %13%\GmuxDriver.sys
+
+; Without this section the KMDF loader is never told to bind the driver.
+[GmuxDriver_Device.NT.Wdf]
+KmdfService = GmuxDriver, GmuxDriver_wdfsect
+
+[GmuxDriver_wdfsect]
+KmdfLibraryVersion = $KMDFVERSION$
+
 [Strings]
-ManufacturerName = "Homebrew"
-DeviceDesc = "Apple GMUX Control Device"
-ServiceDesc = "GMUX Control Service"
+SPSVCINST_ASSOCSERVICE = 0x00000002
+ManufacturerName       = "Osaul4ik"
+DiskName               = "Gmux Driver Installation Disk"
+DeviceDesc             = "Apple GMUX Control Device"
+ServiceDesc            = "GMUX Control Service"

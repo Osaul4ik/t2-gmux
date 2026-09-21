@@ -43,7 +43,7 @@ EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL EvtIoDeviceControl;
 static BOOLEAN PollCommandClear(PUCHAR Base, ULONG TimeoutMs);
 static BOOLEAN GmuxRead8(PUCHAR Base, UCHAR Port, PUCHAR Value);
 static BOOLEAN GmuxWrite8(PUCHAR Base, UCHAR Port, UCHAR Value);
-static VOID    GmuxSetDiscretePower(PUCHAR Base, BOOLEAN PowerOn, ULONG SettleMs);
+static BOOLEAN GmuxSetDiscretePower(PUCHAR Base, BOOLEAN PowerOn, ULONG SettleMs);
 static BOOLEAN GmuxSwitchDisplayRoute(PUCHAR Base, BOOLEAN ToDiscrete);
 static BOOLEAN GmuxSwitchTo(PUCHAR Base, BOOLEAN ToDiscrete);
 static NTSTATUS EnsureMapped(PDEVICE_CONTEXT Context);
@@ -90,11 +90,11 @@ GmuxWrite8(_In_ PUCHAR Base, _In_ UCHAR Port, _In_ UCHAR Value)
 }
 
 // ---- dGPU power rail sequencing (mirrors gmux_set_discrete_state) ----
-static VOID
+static BOOLEAN
 GmuxSetDiscretePower(_In_ PUCHAR Base, _In_ BOOLEAN PowerOn, _In_ ULONG SettleMs)
 {
-    GmuxWrite8(Base, GMUX_PORT_DISCRETE_POWER, 1);
-    GmuxWrite8(Base, GMUX_PORT_DISCRETE_POWER, PowerOn ? 3 : 0);
+    BOOLEAN ok = GmuxWrite8(Base, GMUX_PORT_DISCRETE_POWER, 1);
+    ok = (BOOLEAN)(GmuxWrite8(Base, GMUX_PORT_DISCRETE_POWER, PowerOn ? 3 : 0) && ok);
 
     // No ACPI GPE completion signal available here; approximate the
     // interrupt-based wait Linux performs with a fixed settle delay.
@@ -102,7 +102,8 @@ GmuxSetDiscretePower(_In_ PUCHAR Base, _In_ BOOLEAN PowerOn, _In_ ULONG SettleMs
     interval.QuadPart = -((LONGLONG)SettleMs * 10000);
     KeDelayExecutionThread(KernelMode, FALSE, &interval);
 
-    DbgPrint("[Gmux] Discrete power %s\n", PowerOn ? "ON" : "OFF");
+    DbgPrint("[Gmux] Discrete power %s: %d\n", PowerOn ? "ON" : "OFF", ok);
+    return ok;
 }
 
 // ---- Panel route only (mirrors gmux_switchto) ----
@@ -119,13 +120,19 @@ static BOOLEAN
 GmuxSwitchTo(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete)
 {
     if (ToDiscrete) {
-        GmuxSetDiscretePower(Base, TRUE, 250);
+        // Never route the panel to a dGPU whose rail did not come up.
+        if (!GmuxSetDiscretePower(Base, TRUE, 250)) {
+            return FALSE;
+        }
     }
 
     BOOLEAN ok = GmuxSwitchDisplayRoute(Base, ToDiscrete);
 
     if (!ToDiscrete) {
-        GmuxSetDiscretePower(Base, FALSE, 250);
+        // Only power the dGPU down if the panel actually moved to the iGPU.
+        if (ok) {
+            ok = GmuxSetDiscretePower(Base, FALSE, 250);
+        }
     }
 
     return ok;
@@ -142,7 +149,8 @@ EnsureMapped(_In_ PDEVICE_CONTEXT Context)
     PHYSICAL_ADDRESS physAddr;
     physAddr.QuadPart = GMUX_PHYS_BASE;
 
-    Context->MappedBase = (PUCHAR)MmMapIoSpace(physAddr, GMUX_MMIO_SIZE, MmNonCached);
+    Context->MappedBase = (PUCHAR)MmMapIoSpaceEx(physAddr, GMUX_MMIO_SIZE,
+                                                 PAGE_READWRITE | PAGE_NOCACHE);
     if (Context->MappedBase == NULL) {
         DbgPrint("[Gmux] MmMapIoSpace failed\n");
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -233,6 +241,20 @@ EvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
     UNICODE_STRING symbolicLinkName;
     RtlInitUnicodeString(&symbolicLinkName, L"\\DosDevices\\GmuxCtl");
 
+    // WdfDeviceCreateSymbolicLink needs a named device object, and this
+    // interface writes raw gmux registers - restrict it to SYSTEM/Administrators.
+    UNICODE_STRING deviceName;
+    RtlInitUnicodeString(&deviceName, L"\\Device\\GmuxCtl");
+    status = WdfDeviceInitAssignName(DeviceInit, &deviceName);
+    if (!NT_SUCCESS(status)) return status;
+
+    DECLARE_CONST_UNICODE_STRING(sddl, L"D:P(A;;GA;;;SY)(A;;GA;;;BA)"); // SYSTEM + Administrators only
+    status = WdfDeviceInitAssignSDDLString(DeviceInit, &sddl);
+    if (!NT_SUCCESS(status)) return status;
+
+    WdfDeviceInitSetDeviceType(DeviceInit, FILE_DEVICE_UNKNOWN);
+    WdfDeviceInitSetCharacteristics(DeviceInit, FILE_DEVICE_SECURE_IO, FALSE);
+
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, DEVICE_CONTEXT);
     attributes.EvtCleanupCallback = EvtDeviceContextCleanup;
 
@@ -276,6 +298,9 @@ EvtIoDeviceControl(
     _In_ size_t InputBufferLength,
     _In_ ULONG IoControlCode)
 {
+    UNREFERENCED_PARAMETER(OutputBufferLength);
+    UNREFERENCED_PARAMETER(InputBufferLength);
+
     NTSTATUS status = STATUS_SUCCESS;
     WDFDEVICE device = WdfIoQueueGetDevice(Queue);
     PDEVICE_CONTEXT context = GetDeviceContext(device);

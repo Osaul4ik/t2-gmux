@@ -1,0 +1,545 @@
+name: CI (CodeQL + PREfast + Build + Sign)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  PROJECT_DIR: .
+  DRIVER_NAME: GmuxDriver
+  # INF file base name (gmux.inf). CatalogFile inside it still says GmuxDriver.cat, so CAT_PATH stays DRIVER_NAME-based.
+  INF_NAME: gmux
+  # Single source of truth for the KMDF version: must be <= the KMDF built into the
+  # target OS. Used for StampInf (-k) and passed to msbuild. wellspring-ptp ships 1.33.
+  KMDF_VERSION: "1.33"
+  CONFIGURATION: Release
+  PLATFORM: x64
+
+jobs:
+
+  # ===========================================================================
+  # Один job, один раннер, один build. CodeQL трасує єдину компіляцію (з
+  # прапорами PREfast всередині), потім mustrun/mustfix аналіз бази, і якщо
+  # mustfix чистий - той самий .sys, що лежить на диску цього ж раннера,
+  # стемпається/підписується й пакується. Ніякого cache/artifact для
+  # передачі .sys чи WDK-тулів між стадіями - все на одному диску.
+  # ===========================================================================
+  ci:
+    name: CodeQL + PREfast + BuildKM
+    runs-on: windows-2022
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      security-events: write
+    env:
+      CODEQL_CLI_VERSION: 2.24.1
+      CODEQL_DRIVERS_PACK_VERSION: 1.8.2
+      CODEQL_CPP_QUERIES_PACK_VERSION: 0.0.4
+      CA_TREAT_WARNINGS_AS_ERRORS: true
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Add MSBuild to PATH
+      uses: microsoft/setup-msbuild@v2
+
+    - name: Install WDK
+      run: |
+        $ErrorActionPreference = "Stop"
+        $wdkUrl = "https://go.microsoft.com/fwlink/?linkid=2085767"
+        $wdkInstaller = "$env:TEMP\wdksetup.exe"
+        Invoke-WebRequest -Uri $wdkUrl -OutFile $wdkInstaller
+        $proc = Start-Process -FilePath $wdkInstaller -ArgumentList "/quiet /norestart" -Wait -PassThru
+        $exitCode = $proc.ExitCode
+        if ($exitCode -ne 0 -and $exitCode -ne 3010) {
+          Write-Error "WDK installer exited with code $exitCode"
+          exit 1
+        }
+        Write-Host "OK: WDK installer exited with code $exitCode"
+      shell: pwsh
+
+    - name: Download CodeQL CLI
+      run: |
+        $ErrorActionPreference = "Stop"
+        $url = "https://github.com/github/codeql-cli-binaries/releases/download/v$env:CODEQL_CLI_VERSION/codeql-win64.zip"
+        Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\codeql.zip"
+        Expand-Archive -Path "$env:TEMP\codeql.zip" -DestinationPath "$env:TEMP\codeql-home" -Force
+        $codeqlExe = Get-ChildItem -Path "$env:TEMP\codeql-home" -Filter "codeql.exe" -Recurse | Select-Object -First 1
+        if (-not $codeqlExe) {
+          Write-Error "codeql.exe not found after extraction."
+          exit 1
+        }
+        Add-Content -Path $env:GITHUB_ENV -Value "CODEQL_DIR=$($codeqlExe.DirectoryName)"
+      shell: pwsh
+
+    - name: Verify CodeQL install
+      run: |
+        & "$env:CODEQL_DIR\codeql.exe" --version
+      shell: pwsh
+
+    - name: Download windows-drivers query pack
+      run: |
+        $ErrorActionPreference = "Stop"
+        & "$env:CODEQL_DIR\codeql.exe" pack download "microsoft/windows-drivers@$env:CODEQL_DRIVERS_PACK_VERSION"
+      shell: pwsh
+
+    - name: Download cpp-queries dependency pack
+      run: |
+        $ErrorActionPreference = "Stop"
+        & "$env:CODEQL_DIR\codeql.exe" pack download "microsoft/cpp-queries@$env:CODEQL_CPP_QUERIES_PACK_VERSION"
+      shell: pwsh
+
+    # =====================================================================
+    # Єдина компіляція всього пайплайна: CodeQL трасує саме цей msbuild-
+    # виклик, а сам виклик вже несе прапори PREfast (/p:RunCodeAnalysis
+    # /p:EnableCppCoreCheck /p:CodeAnalysisTreatWarningsAsErrors). Якщо
+    # PREfast знайде warning (з /WX) - msbuild впаде з ненульовим кодом,
+    # і `codeql database create` впаде разом з ним.
+    # =====================================================================
+    - name: Build CodeQL database (with PREfast /analyze baked in)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $dbPath  = "$env:TEMP\codeql-db"
+        $logDir  = Join-Path $env:GITHUB_WORKSPACE "static-analysis-logs"
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+        $buildLog = Join-Path $logDir "build.log"
+
+        $buildCmd = "msbuild /p:Configuration=$env:CONFIGURATION /p:Platform=$env:PLATFORM " +
+                    "/p:WindowsTargetPlatformVersion=10.0.26100.0 /p:KMDF_VERSION_MAJOR=1 /p:KMDF_VERSION_MINOR=$($env:KMDF_VERSION.Split('.')[1]) " +
+                    "/p:RunCodeAnalysis=true /p:EnableCppCoreCheck=true " +
+                    "/p:CodeAnalysisTreatWarningsAsErrors=$env:CA_TREAT_WARNINGS_AS_ERRORS " +
+                    "/nologo /verbosity:normal /clp:Summary " +
+                    "/flp:logfile=$buildLog;verbosity=normal " +
+                    "$env:PROJECT_DIR\$env:DRIVER_NAME.vcxproj /t:rebuild"
+
+        & "$env:CODEQL_DIR\codeql.exe" database create $dbPath `
+          --language=cpp `
+          --source-root=. `
+          --command=$buildCmd
+
+        Add-Content -Path $env:GITHUB_ENV -Value "CODEQL_DB=$dbPath"
+        Add-Content -Path $env:GITHUB_ENV -Value "BUILD_LOG_DIR=$logDir"
+      shell: pwsh
+
+    - name: Upload build logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: static-analysis-logs
+        retention-days: 14
+        if-no-files-found: warn
+        path: static-analysis-logs/
+
+    - name: Analyze with mustrun.qls (informational)
+      run: |
+        $ErrorActionPreference = "Stop"
+        & "$env:CODEQL_DIR\codeql.exe" database analyze "$env:CODEQL_DB" `
+          "microsoft/windows-drivers:windows-driver-suites/mustrun.qls" `
+          --format=sarifv2.1.0 `
+          --output="$env:TEMP\codeql-mustrun.sarif"
+        Add-Content -Path $env:GITHUB_ENV -Value "SARIF_MUSTRUN=$env:TEMP\codeql-mustrun.sarif"
+      shell: pwsh
+
+    - name: Analyze with mustfix.qls (blocking)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $sarifPath = "$env:TEMP\codeql-mustfix.sarif"
+
+        & "$env:CODEQL_DIR\codeql.exe" database analyze "$env:CODEQL_DB" `
+          "microsoft/windows-drivers:windows-driver-suites/mustfix.qls" `
+          --format=sarifv2.1.0 `
+          --output=$sarifPath
+
+        Add-Content -Path $env:GITHUB_ENV -Value "SARIF_MUSTFIX=$sarifPath"
+
+        $sarif = Get-Content -Path $sarifPath -Raw | ConvertFrom-Json
+        $resultCount = 0
+        foreach ($run in $sarif.runs) {
+          if ($run.results) { $resultCount += $run.results.Count }
+        }
+        Write-Host "==> mustfix.qls results: $resultCount"
+
+        if ($resultCount -gt 0) {
+          Write-Host "::error::$resultCount Must-Fix defect(s) found - this driver would FAIL the WHCP Static Tools Logo Test."
+          exit 1
+        }
+        Write-Host "OK: 0 Must-Fix defects."
+      shell: pwsh
+
+    - name: Upload SARIF results as build artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: codeql-results
+        retention-days: 14
+        path: |
+          ${{ env.SARIF_MUSTRUN }}
+          ${{ env.SARIF_MUSTFIX }}
+
+    - name: Upload mustrun.qls SARIF to GitHub code scanning
+      if: always()
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ env.SARIF_MUSTRUN }}
+        category: mustrun
+
+    - name: Upload mustfix.qls SARIF to GitHub code scanning
+      if: always()
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: ${{ env.SARIF_MUSTFIX }}
+        category: mustfix
+
+    # =====================================================================
+    # Все, що нижче, виконається лише якщо mustfix.qls вище пройшов чисто
+    # (exit 0) - жоден із цих кроків не має if: always(), тому при
+    # Must-Fix дефекті job зупиняється на кроці вище і сюди не доходить:
+    # ані стемп/підпис не запуститься, ані фінальний артефакт не з'явиться.
+    # =====================================================================
+
+    # =====================================================================
+    # Перевірка секретів підпису перед пакуванням.
+    # =====================================================================
+    - name: Validate signing secrets are present
+      run: |
+        $ErrorActionPreference = "Stop"
+        Write-Host "==> Checking SIGN_CERT_PFX / SIGN_CERT_PASSWORD secrets"
+
+        if ([string]::IsNullOrWhiteSpace($env:SIGN_CERT_PFX)) {
+          Write-Error "Secret SIGN_CERT_PFX is not set in GitHub Secrets. Add the Base64-encoded PFX certificate in Settings -> Secrets and variables -> Actions."
+          exit 1
+        }
+        if ([string]::IsNullOrWhiteSpace($env:SIGN_CERT_PASSWORD)) {
+          Write-Error "Secret SIGN_CERT_PASSWORD is not set in GitHub Secrets."
+          exit 1
+        }
+
+        Write-Host "OK: both secrets are present."
+      shell: pwsh
+      env:
+        SIGN_CERT_PFX: ${{ secrets.CERT }}
+        SIGN_CERT_PASSWORD: ${{ secrets.CERT_PWD }}
+
+    # =====================================================================
+    # Обчислення версії/дати драйвера на основі поточної дати й часу.
+    # Формат версії: 1.<рік>.<місяцьдень>.<годинахвилина>, напр. 1.2026.0729.1435
+    # =====================================================================
+    - name: Compute driver version and date
+      run: |
+        $ErrorActionPreference = "Stop"
+        $now = Get-Date
+
+        $driverDate    = $now.ToString("MM/dd/yyyy")
+        $driverVersion = "1.$($now.Year).$($now.ToString('MMdd')).$($now.ToString('HHmm'))"
+
+        Write-Host "==> Driver date (DriverVer date): $driverDate"
+        Write-Host "==> Driver version (DriverVer ver): $driverVersion"
+
+        Add-Content -Path $env:GITHUB_ENV -Value "DRIVER_DATE=$driverDate"
+        Add-Content -Path $env:GITHUB_ENV -Value "DRIVER_VERSION=$driverVersion"
+      shell: pwsh
+
+    # =====================================================================
+    # .sys уже лежить на диску цього ж раннера (той самий build вище) -
+    # просто беремо його з build-виводу проєкту, без cache/download.
+    # Готуємо окрему "staging" теку package/, куди кладемо тільки
+    # .sys та .inf, що стосуються GmuxDriver.
+    # =====================================================================
+    - name: Prepare signing package folder
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        $buildOutDir = "$env:PROJECT_DIR\build\$env:DRIVER_NAME\$env:PLATFORM\$env:CONFIGURATION"
+        $sysPath     = "$buildOutDir\$env:DRIVER_NAME.sys"
+        $infSrcPath  = "$env:PROJECT_DIR\$env:INF_NAME.inf"
+        $packageDir  = "package"
+
+        Write-Host "==> Expected .sys path: $sysPath"
+        if (-not (Test-Path $sysPath)) {
+          Write-Error "Built .sys not found: $sysPath. Check the 'Build CodeQL database' step."
+          exit 1
+        }
+        if (-not (Test-Path $infSrcPath)) {
+          Write-Error ".inf file not found: $infSrcPath."
+          exit 1
+        }
+
+        New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+        Copy-Item -Path $sysPath    -Destination $packageDir -Force
+        Copy-Item -Path $infSrcPath -Destination $packageDir -Force
+
+        Write-Host "OK: copied into $packageDir :"
+        Get-ChildItem $packageDir | ForEach-Object { Write-Host "  - $($_.Name)" }
+
+        Add-Content -Path $env:GITHUB_ENV -Value "PACKAGE_DIR=$packageDir"
+        Add-Content -Path $env:GITHUB_ENV -Value "SYS_PATH=$packageDir\$env:DRIVER_NAME.sys"
+        Add-Content -Path $env:GITHUB_ENV -Value "INF_PATH=$packageDir\$env:INF_NAME.inf"
+        Add-Content -Path $env:GITHUB_ENV -Value "CAT_PATH=$packageDir\$env:DRIVER_NAME.cat"
+      shell: pwsh
+
+    # =====================================================================
+    # Автопошук StampInf.exe (WDK вже стоїть на цьому ж раннері)
+    # =====================================================================
+    - name: Locate StampInf.exe
+      run: |
+        $ErrorActionPreference = "Stop"
+        Write-Host "==> Searching for StampInf.exe under Windows Kits..."
+
+        $roots = @(
+          "C:\Program Files (x86)\Windows Kits\10\bin",
+          "C:\Program Files\Windows Kits\10\bin"
+        )
+
+        $candidates = foreach ($root in $roots) {
+          if (Test-Path $root) {
+            Get-ChildItem -Path $root -Filter "StampInf.exe" -Recurse -ErrorAction SilentlyContinue
+          }
+        }
+
+        if (-not $candidates) {
+          Write-Error "StampInf.exe was not found on this runner. Make sure the Windows SDK/WDK is installed."
+          exit 1
+        }
+
+        $tool = $candidates | Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+        if (-not $tool) {
+          $tool = $candidates | Sort-Object FullName -Descending | Select-Object -First 1
+        }
+
+        Write-Host "OK: found StampInf.exe -> $($tool.FullName)"
+        Add-Content -Path $env:GITHUB_ENV -Value "STAMPINF_PATH=$($tool.FullName)"
+      shell: pwsh
+
+    # =====================================================================
+    # Стампуємо staged .inf у package/ - підставляємо архітектуру
+    # (amd64), дату й версію та версію KMDF (env KMDF_VERSION).
+    # =====================================================================
+    - name: Stamp INF (architecture / date / version / KMDF)
+      run: |
+        $ErrorActionPreference = "Stop"
+        $infPath = (Resolve-Path $env:INF_PATH).Path
+
+        Write-Host "==> Stamping $infPath"
+        & "$env:STAMPINF_PATH" -f "$infPath" -a amd64 -d "$env:DRIVER_DATE" -v "$env:DRIVER_VERSION" -k $env:KMDF_VERSION
+
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "StampInf exited with error code $LASTEXITCODE."
+          exit 1
+        }
+
+        Write-Host "==> Stamped INF contents:"
+        Get-Content -Path $infPath | Select-String -Pattern 'DriverVer|NTamd64|KmdfLibraryVersion'
+        Write-Host "OK: INF stamped."
+      shell: pwsh
+
+    # =====================================================================
+    # InfVerif на вже ЗАСТЕМПЛЕНОМУ INF (з $ARCH$/$KMDFVERSION$ він би не
+    # пройшов). Поки що не блокує збірку - подивись вивід і за потреби
+    # прибери continue-on-error.
+    # =====================================================================
+    - name: InfVerif (informational)
+      continue-on-error: true
+      run: |
+        $ErrorActionPreference = "Stop"
+        $tool = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\Tools" -Filter "infverif.exe" -Recurse -ErrorAction SilentlyContinue |
+          Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+        if (-not $tool) { Write-Host "::warning::infverif.exe not found"; exit 0 }
+        Write-Host "==> $($tool.FullName)"
+        & $tool.FullName /v /w (Resolve-Path $env:INF_PATH).Path
+        if ($LASTEXITCODE -ne 0) { Write-Host "::warning::InfVerif exit code $LASTEXITCODE"; exit $LASTEXITCODE }
+      shell: pwsh
+
+    # =====================================================================
+    # Автопошук Inf2Cat.exe
+    # =====================================================================
+    - name: Locate Inf2Cat.exe
+      run: |
+        $ErrorActionPreference = "Stop"
+        Write-Host "==> Searching for Inf2Cat.exe under Windows Kits..."
+
+        $roots = @(
+          "C:\Program Files (x86)\Windows Kits\10\bin",
+          "C:\Program Files\Windows Kits\10\bin"
+        )
+
+        $candidates = foreach ($root in $roots) {
+          if (Test-Path $root) {
+            Get-ChildItem -Path $root -Filter "Inf2Cat.exe" -Recurse -ErrorAction SilentlyContinue
+          }
+        }
+
+        if (-not $candidates) {
+          Write-Error "Inf2Cat.exe was not found on this runner. Make sure the Windows SDK/WDK is installed."
+          exit 1
+        }
+
+        $tool = $candidates | Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+        if (-not $tool) {
+          $tool = $candidates | Sort-Object FullName -Descending | Select-Object -First 1
+        }
+
+        Write-Host "OK: found Inf2Cat.exe -> $($tool.FullName)"
+        Add-Content -Path $env:GITHUB_ENV -Value "INF2CAT_PATH=$($tool.FullName)"
+      shell: pwsh
+
+    # =====================================================================
+    # Генерація .cat файлу з .inf через Inf2Cat.
+    # =====================================================================
+    - name: Generate CAT file (Inf2Cat)
+      run: |
+        $ErrorActionPreference = "Stop"
+        Write-Host "==> Generating catalog for $env:PACKAGE_DIR"
+
+        $fullPackageDir = (Resolve-Path $env:PACKAGE_DIR).Path
+        & "$env:INF2CAT_PATH" /driver:"$fullPackageDir" /os:10_X64 /verbose
+
+        if ($LASTEXITCODE -ne 0) {
+          Write-Error "Inf2Cat exited with error code $LASTEXITCODE."
+          exit 1
+        }
+        if (-not (Test-Path $env:CAT_PATH)) {
+          Write-Error "Inf2Cat did not report an error, but no .cat file was produced at $env:CAT_PATH."
+          exit 1
+        }
+
+        Write-Host "OK: .cat generated -> $env:CAT_PATH"
+      shell: pwsh
+
+    # =====================================================================
+    # Автопошук signtool.exe
+    # =====================================================================
+    - name: Locate signtool.exe
+      run: |
+        $ErrorActionPreference = "Stop"
+        Write-Host "==> Searching for signtool.exe under Windows Kits..."
+
+        $roots = @(
+          "C:\Program Files (x86)\Windows Kits\10\bin",
+          "C:\Program Files\Windows Kits\10\bin"
+        )
+
+        $candidates = foreach ($root in $roots) {
+          if (Test-Path $root) {
+            Get-ChildItem -Path $root -Filter "signtool.exe" -Recurse -ErrorAction SilentlyContinue
+          }
+        }
+
+        if (-not $candidates) {
+          Write-Error "signtool.exe was not found on this runner. Make sure the Windows SDK/WDK is installed."
+          exit 1
+        }
+
+        $tool = $candidates | Where-Object { $_.FullName -match '\\x64\\' } | Sort-Object FullName -Descending | Select-Object -First 1
+        if (-not $tool) {
+          $tool = $candidates | Sort-Object FullName -Descending | Select-Object -First 1
+        }
+
+        Write-Host "OK: found signtool.exe -> $($tool.FullName)"
+        Add-Content -Path $env:GITHUB_ENV -Value "SIGNTOOL_PATH=$($tool.FullName)"
+      shell: pwsh
+
+    # =====================================================================
+    # Декодування PFX із секрету, підпис .sys і .cat, експорт
+    # публічного сертифіката (.cer) для встановлення довіри на цільових
+    # машинах.
+    # =====================================================================
+    - name: Sign .sys and .cat with SignTool
+      run: |
+        $ErrorActionPreference = "Stop"
+        $pfxPath = Join-Path $env:TEMP "signcert.pfx"
+        $cerPath = Join-Path $env:PACKAGE_DIR "$env:DRIVER_NAME.cer"
+
+        try {
+          Write-Host "==> Decoding SIGN_CERT_PFX into a temporary file"
+          $bytes = [Convert]::FromBase64String($env:SIGN_CERT_PFX)
+          [IO.File]::WriteAllBytes($pfxPath, $bytes)
+
+          Write-Host "==> Signing $env:SYS_PATH"
+          & "$env:SIGNTOOL_PATH" sign /v /fd SHA256 /f "$pfxPath" /p "$env:SIGN_CERT_PASSWORD" `
+            /tr http://timestamp.digicert.com /td SHA256 "$env:SYS_PATH"
+          if ($LASTEXITCODE -ne 0) { Write-Error "Signing .sys failed (exit code $LASTEXITCODE)."; exit 1 }
+
+          Write-Host "==> Signing $env:CAT_PATH"
+          & "$env:SIGNTOOL_PATH" sign /v /fd SHA256 /f "$pfxPath" /p "$env:SIGN_CERT_PASSWORD" `
+            /tr http://timestamp.digicert.com /td SHA256 "$env:CAT_PATH"
+          if ($LASTEXITCODE -ne 0) { Write-Error "Signing .cat failed (exit code $LASTEXITCODE)."; exit 1 }
+
+          Write-Host "==> Exporting public certificate for target-machine trust -> $cerPath"
+          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2(
+            $pfxPath, $env:SIGN_CERT_PASSWORD,
+            [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable
+          )
+          Export-Certificate -Cert $cert -FilePath $cerPath | Out-Null
+
+          Write-Host "OK: .sys and .cat signed; .cer exported."
+          Add-Content -Path $env:GITHUB_ENV -Value "CER_PATH=$cerPath"
+        }
+        finally {
+          if (Test-Path $pfxPath) {
+            Write-Host "==> Removing temporary .pfx"
+            Remove-Item -Path $pfxPath -Force
+          }
+        }
+      shell: pwsh
+      env:
+        SIGN_CERT_PFX: ${{ secrets.CERT }}
+        SIGN_CERT_PASSWORD: ${{ secrets.CERT_PWD }}
+
+    # =====================================================================
+    # User-mode CLI (gmux.exe). Збирається ПІСЛЯ драйвера й аналізу - PREfast
+    # і CodeQL її не чіпають.
+    # =====================================================================
+    - name: Build gmux.exe (CLI)
+      run: |
+        $ErrorActionPreference = "Stop"
+        msbuild GmuxCtl.vcxproj /p:Configuration=Release /p:Platform=x64 /nologo /verbosity:minimal
+        if ($LASTEXITCODE -ne 0) { Write-Error "GmuxCtl build failed ($LASTEXITCODE)"; exit 1 }
+        $exe = "build\GmuxCtl\x64\Release\gmux.exe"
+        if (-not (Test-Path $exe)) { Write-Error "gmux.exe not found at $exe"; exit 1 }
+        Add-Content -Path $env:GITHUB_ENV -Value "CLI_PATH=$exe"
+      shell: pwsh
+
+    # =====================================================================
+    # Створюємо структуру папок для архіву з папкою GmuxDriver всередині.
+    # =====================================================================
+    - name: Prepare final package folder
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        # Створюємо тимчасову теку, яка буде коренем для архіву
+        $tempRoot = "temp-upload"
+        $stagingDir = Join-Path $tempRoot "GmuxDriver"
+
+        Write-Host "==> Preparing staging folder $stagingDir"
+        New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
+
+        Copy-Item -Path $env:SYS_PATH -Destination $stagingDir -Force
+        Copy-Item -Path $env:INF_PATH -Destination $stagingDir -Force
+        Copy-Item -Path $env:CAT_PATH -Destination $stagingDir -Force
+        Copy-Item -Path $env:CER_PATH -Destination $stagingDir -Force
+        Copy-Item -Path $env:CLI_PATH -Destination $stagingDir -Force
+
+        Write-Host "OK: staged files:"
+        Get-ChildItem $stagingDir | ForEach-Object { Write-Host "  - $($_.Name)" }
+
+        # Зберігаємо шлях до КОРЕНЕВОЇ теки (temp-upload), а не до GmuxDriver
+        Add-Content -Path $env:GITHUB_ENV -Value "STAGING_DIR=$tempRoot"
+      shell: pwsh
+
+    # =====================================================================
+    # Завантаження артефакту - GitHub запакує temp-upload в zip,
+    # і всередині буде папка GmuxDriver з файлами.
+    # =====================================================================
+    - name: Upload signed driver package artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: GmuxDriver-Signed-${{ env.DRIVER_VERSION }}
+        path: ${{ env.STAGING_DIR }}

@@ -3,7 +3,7 @@ name: Build Driver Artifacts
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: []
 
 jobs:
   build-driver:
