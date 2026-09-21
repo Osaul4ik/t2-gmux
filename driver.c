@@ -181,8 +181,11 @@ ReadForceIgdSetting(_In_ WDFDRIVER Driver)
 
     if (NT_SUCCESS(WdfDriverOpenParametersRegistryKey(Driver, KEY_READ,
                                                        WDF_NO_OBJECT_ATTRIBUTES, &key))) {
-        DECLARE_CONST_UNICODE_STRING(valName, L"ForceIGD");
+        UNICODE_STRING valName;
         ULONG readVal;
+
+        RtlInitUnicodeString(&valName, L"ForceIGD");
+
         if (NT_SUCCESS(WdfRegistryQueryULong(key, &valName, &readVal))) {
             value = readVal;
         }
