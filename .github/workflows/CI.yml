@@ -18,8 +18,9 @@ env:
   # INF file base name (gmux.inf). CatalogFile inside it still says GmuxDriver.cat, so CAT_PATH stays DRIVER_NAME-based.
   INF_NAME: gmux
   # Single source of truth for the KMDF version: must be <= the KMDF built into the
-  # target OS. Used for StampInf (-k) and passed to msbuild. wellspring-ptp ships 1.33.
-  KMDF_VERSION: "1.33"
+  # target OS. 1.31 = Windows 10 2004+ (the T2 MacBook's actual Windows build is
+  # older than 22000, so 1.33/Windows-11-only is not present there).
+  KMDF_VERSION: "1.31"
   CONFIGURATION: Release
   PLATFORM: x64
 
