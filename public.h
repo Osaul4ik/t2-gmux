@@ -1,11 +1,12 @@
 // public.h
-// Спільні визначення IOCTL між GmuxDriver.sys та usermode-застосунком (gmux_app.cpp).
-// Цей файл включається в обидва проєкти.
+// Shared IOCTL/struct definitions between GmuxDriver.sys and the usermode
+// client (gmux.cpp). Included by both.
 
 #pragma once
 
-#define IOCTL_GMUX_READ8  CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_GMUX_WRITE8 CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_GMUX_READ8     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_GMUX_WRITE8    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_GMUX_SWITCH_TO CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 typedef struct _GMUX_READ_REQUEST {
     UCHAR Port;
@@ -25,7 +26,26 @@ typedef struct _GMUX_WRITE_RESPONSE {
     BOOLEAN Success;
 } GMUX_WRITE_RESPONSE, *PGMUX_WRITE_RESPONSE;
 
-// Номери "портів" gmux (з Linux apple-gmux.h)
-#define GMUX_PORT_VERSION_MAJOR  0x04
-#define GMUX_PORT_SWITCH_DISPLAY 0x10
-#define GMUX_PORT_DISCRETE_POWER 0x50
+// TargetIsDiscrete: 0 = switch to iGPU, 1 = switch to dGPU
+typedef struct _GMUX_SWITCH_REQUEST {
+    UCHAR TargetIsDiscrete;
+} GMUX_SWITCH_REQUEST, *PGMUX_SWITCH_REQUEST;
+
+typedef struct _GMUX_SWITCH_RESPONSE {
+    BOOLEAN Success;
+} GMUX_SWITCH_RESPONSE, *PGMUX_SWITCH_RESPONSE;
+
+// Full gmux port map, from Linux include/linux/apple-gmux.h
+#define GMUX_PORT_VERSION_MAJOR    0x04
+#define GMUX_PORT_VERSION_MINOR    0x05
+#define GMUX_PORT_VERSION_RELEASE  0x06
+#define GMUX_PORT_SWITCH_DISPLAY   0x10   // panel route: 2 = iGPU, 3 = dGPU
+#define GMUX_PORT_SWITCH_GET_DISPLAY 0x11
+#define GMUX_PORT_INTERRUPT_ENABLE  0x14
+#define GMUX_PORT_INTERRUPT_STATUS  0x16
+#define GMUX_PORT_SWITCH_DDC       0x28   // classic PIO gmux only, unused on T2
+#define GMUX_PORT_SWITCH_EXTERNAL  0x40   // external DP mux
+#define GMUX_PORT_SWITCH_GET_EXTERNAL 0x41
+#define GMUX_PORT_DISCRETE_POWER  0x50   // dGPU power rail sequencing
+#define GMUX_PORT_MAX_BRIGHTNESS  0x70
+#define GMUX_PORT_BRIGHTNESS      0x74

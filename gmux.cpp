@@ -1,8 +1,11 @@
-// gmux_app.c – консольний клієнт для GmuxCtl
+// gmux.cpp - console client for GmuxCtl.
+// Uses IOCTL_GMUX_SWITCH_TO (sequenced power + display route), not a raw
+// display-route-only write - that path is what produced the black screen.
+
 #include <windows.h>
 #include <stdio.h>
 #include <devioctl.h>
-#include "public.h"   // ваш файл з IOCTL та структурами
+#include "public.h"   // shared IOCTL/struct definitions
 
 HANDLE OpenGmux() {
     return CreateFile(L"\\\\.\\GmuxCtl", GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, NULL);
@@ -13,71 +16,53 @@ BOOL Read8(HANDLE h, UCHAR port, PUCHAR value) {
     GMUX_READ_RESPONSE resp = { 0 };
     DWORD bytes;
     if (!DeviceIoControl(h, IOCTL_GMUX_READ8, &req, sizeof(req), &resp, sizeof(resp), &bytes, NULL)) {
-        printf("DeviceIoControl READ8 failed: %d\n", GetLastError());
+        printf("DeviceIoControl READ8 failed: %lu\n", GetLastError());
         return FALSE;
     }
     if (resp.Success) *value = resp.Value;
     return resp.Success;
 }
 
-BOOL Write8(HANDLE h, UCHAR port, UCHAR value) {
-    GMUX_WRITE_REQUEST req = { port, value };
-    GMUX_WRITE_RESPONSE resp = { 0 };
+BOOL SwitchTo(HANDLE h, BOOL toDiscrete) {
+    GMUX_SWITCH_REQUEST req = { (UCHAR)(toDiscrete ? 1 : 0) };
+    GMUX_SWITCH_RESPONSE resp = { 0 };
     DWORD bytes;
-    if (!DeviceIoControl(h, IOCTL_GMUX_WRITE8, &req, sizeof(req), &resp, sizeof(resp), &bytes, NULL)) {
-        printf("DeviceIoControl WRITE8 failed: %d\n", GetLastError());
+    if (!DeviceIoControl(h, IOCTL_GMUX_SWITCH_TO, &req, sizeof(req), &resp, sizeof(resp), &bytes, NULL)) {
+        printf("DeviceIoControl SWITCH_TO failed: %lu\n", GetLastError());
         return FALSE;
     }
     return resp.Success;
 }
 
-int main() {
-    HANDLE h = OpenGmux();
-    if (h == INVALID_HANDLE_VALUE) {
-        printf("Cannot open GmuxCtl. Check driver is installed.\n");
+int main(int argc, char** argv) {
+    if (argc != 2 || (argv[1][0] != 'i' && argv[1][0] != 'd')) {
+        printf("Usage: gmux.exe i|d\n");
+        printf("  i = switch to iGPU (power dGPU rails down after routing)\n");
+        printf("  d = switch to dGPU (power dGPU rails up before routing)\n");
         return 1;
     }
 
-    // ---- Читання версії ----
+    HANDLE h = OpenGmux();
+    if (h == INVALID_HANDLE_VALUE) {
+        printf("Cannot open GmuxCtl (%lu). Check driver is installed and loaded.\n", GetLastError());
+        return 1;
+    }
+
     UCHAR ver;
     if (Read8(h, GMUX_PORT_VERSION_MAJOR, &ver)) {
         printf("GMUX version: %d (0x%02X)\n", ver, ver);
     } else {
-        printf("Failed to read version (maybe hardware not present)\n");
+        printf("Failed to read version (hardware not present?)\n");
         CloseHandle(h);
         return 1;
     }
 
-    // ---- Читання поточного стану перемикача ----
-    UCHAR state;
-    if (Read8(h, GMUX_PORT_SWITCH_DISPLAY, &state)) {
-        printf("Current display switch state: %d (0x%02X) – %s\n",
-               state, state, (state % 2 == 0) ? "iGPU" : "dGPU");
-    }
+    BOOL toDiscrete = (argv[1][0] == 'd');
+    printf("Switching to %s ...\n", toDiscrete ? "dGPU" : "iGPU");
 
-    // ---- Потужність dGPU ----
-    UCHAR power;
-    if (Read8(h, GMUX_PORT_DISCRETE_POWER, &power)) {
-        printf("Discrete GPU power: 0x%02X (%s)\n", power, power ? "ON" : "OFF");
-    }
-
-    printf("\n============================================\n");
-    printf("WARNING: Writing to port 0x10 can switch display.\n");
-    printf("On MacBookPro16,1 reverse switching may NOT work.\n");
-    printf("Value 2 = force iGPU, 3 = force dGPU (typical).\n");
-    printf("Do you want to write value 2 (force iGPU)? (y/n): ");
-
-    char c = getchar();
-    if (c == 'y' || c == 'Y') {
-        if (Write8(h, GMUX_PORT_SWITCH_DISPLAY, 2)) {
-            printf("Write successful. Check display.\n");
-        } else {
-            printf("Write failed.\n");
-        }
-    } else {
-        printf("No write performed.\n");
-    }
+    BOOL ok = SwitchTo(h, toDiscrete);
+    printf(ok ? "Switch reported success.\n" : "Switch reported FAILURE.\n");
 
     CloseHandle(h);
-    return 0;
+    return ok ? 0 : 1;
 }
