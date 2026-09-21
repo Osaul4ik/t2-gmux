@@ -8,10 +8,12 @@
 #define IOCTL_GMUX_WRITE8    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_GMUX_SWITCH_TO CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
 // Granular building blocks so the client can insert PnP steps between them:
-//   ROUTE          - panel route (port 0x10) AND external DP mux (port 0x40), written in
-//                    that order like Linux gmux_switchto() (GMUX_SWITCH_REQUEST/RESPONSE,
-//                    TargetIsDiscrete). Success reflects the panel write; a failed external
-//                    write is only logged (models without an external mux).
+//   ROUTE          - DDC (port 0x28), panel route (port 0x10) and external DP mux (port
+//                    0x40), written in that order like Linux gmux_switchto()
+//                    (GMUX_SWITCH_REQUEST/RESPONSE, TargetIsDiscrete). The external mux is
+//                    forced to the dGPU unless Parameters\ExternalFollowsPanel is set (Linux
+//                    does the same on Thunderbolt Macs). Success reflects the panel write; a
+//                    failed DDC / external write is only logged.
 //   POWER          - dGPU power rail only (GMUX_POWER_REQUEST/RESPONSE)
 //   ROUTE_EXTERNAL - external DP mux only (port 0x40), same request/response as ROUTE
 #define IOCTL_GMUX_ROUTE     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
@@ -19,7 +21,8 @@
 // Boot default. The driver keeps the panel route in
 //   HKLM\SYSTEM\CurrentControlSet\Services\<service>\Parameters\DefaultRoute
 // and re-applies it every time the gmux device starts (= every Windows boot).
-//   SET_DEFAULT   - read the CURRENT route from the hardware and store it as the default
+//   SET_DEFAULT   - read the CURRENT panel route from the hardware (port 0x10 bit 0) and
+//                   store it as the default
 //   GET_DEFAULT   - report the stored default (Route 0 = none stored)
 //   CLEAR_DEFAULT - delete the stored default
 #define IOCTL_GMUX_SET_DEFAULT   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_ANY_ACCESS)
@@ -28,9 +31,15 @@
 // External DP mux only (for testing one thing at a time; ROUTE already covers both muxes).
 #define IOCTL_GMUX_ROUTE_EXTERNAL CTL_CODE(FILE_DEVICE_UNKNOWN, 0x808, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
-// Route values are the same numbers gmux uses on ports 0x10 / 0x11 (panel) and 0x40 / 0x41 (external).
+// Route values as WRITTEN to ports 0x10 (panel) and 0x40 (external). They are also what this
+// project stores as the boot default. Readback is different: the panel route is read from
+// port 0x10 bit 0 (1 = dGPU, 0 = iGPU); port 0x11 gives 3 / 0 and 0x41 gives 0x00 / 0x10 on T2.
 #define GMUX_ROUTE_IGD   2
 #define GMUX_ROUTE_DGPU  3
+
+// DDC/AUX line (port 0x28) uses its own numbering: 1 = iGPU, 2 = dGPU.
+#define GMUX_DDC_IGD     1
+#define GMUX_DDC_DGPU    2
 
 typedef struct _GMUX_READ_REQUEST {
     UCHAR Port;
@@ -79,12 +88,12 @@ typedef struct _GMUX_DEFAULT_RESPONSE {
 #define GMUX_PORT_VERSION_MINOR    0x05
 #define GMUX_PORT_VERSION_RELEASE  0x06
 #define GMUX_PORT_SWITCH_DISPLAY   0x10   // panel route: 2 = iGPU, 3 = dGPU
-#define GMUX_PORT_SWITCH_GET_DISPLAY 0x11
+#define GMUX_PORT_SWITCH_GET_DISPLAY 0x11  // informational only: 3 = dGPU, 0 = iGPU on T2 (Linux reads 0x10 bit 0)
 #define GMUX_PORT_INTERRUPT_ENABLE  0x14
 #define GMUX_PORT_INTERRUPT_STATUS  0x16
-#define GMUX_PORT_SWITCH_DDC       0x28   // classic PIO gmux only, unused on T2
+#define GMUX_PORT_SWITCH_DDC       0x28   // panel DDC/AUX: 1 = iGPU, 2 = dGPU (written by Linux on every gmux type)
 #define GMUX_PORT_SWITCH_EXTERNAL  0x40   // external DP mux: 2 = iGPU, 3 = dGPU (separate from the panel mux)
-#define GMUX_PORT_SWITCH_GET_EXTERNAL 0x41  // external DP mux readback
+#define GMUX_PORT_SWITCH_GET_EXTERNAL 0x41  // informational only: 0x00 with dGPU, 0x10 with iGPU on T2
 #define GMUX_PORT_DISCRETE_POWER  0x50   // dGPU power rail sequencing
 #define GMUX_PORT_MAX_BRIGHTNESS  0x70
 #define GMUX_PORT_BRIGHTNESS      0x74

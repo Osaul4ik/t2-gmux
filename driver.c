@@ -15,19 +15,29 @@
 //     interrupt-based completion wait Linux uses is approximated with a
 //     fixed delay; Linux itself skips the wait when no GPE is found, so
 //     this is not worse than that fallback path).
+//   - GmuxSwitchDdc(): panel DDC/AUX line (port 0x28: 1 = iGPU, 2 = dGPU). Linux
+//     gmux_switchto() writes it for EVERY gmux type (gmux_write_switch_state() is not
+//     conditional); the old comment here claiming it is "classic PIO only" was wrong.
+//     Without it the panel's EDID/DPCD stays on the Radeon, so the Intel driver cannot
+//     read the panel and the screen stays black after the panel mux moved to the iGPU.
 //   - GmuxSwitchDisplayRoute(): panel mux only (port 0x10).
-//   - GmuxSwitchExternalRoute(): external DP mux only (port 0x40). The gmux has TWO
-//     independent muxes; Linux gmux_switchto() writes both, and so does
-//     GmuxSwitchAllRoutes(). Before this, the external mux was never written, so an
-//     external monitor stayed wherever the firmware / an earlier power cycle left it.
+//   - GmuxSwitchExternalRoute(): external DP mux only (port 0x40). Linux only follows the
+//     panel with this mux when no Thunderbolt controller is present; on Thunderbolt Macs
+//     (MBP16,1 has one) it forces the external AUX channel to the dGPU (value 3) and never
+//     switches it. GmuxSwitchAllRoutes() does the same unless the registry value
+//     Parameters\ExternalFollowsPanel (REG_DWORD, 1) is set.
+//   - GmuxReadPanelRoute(): current panel route read the way Linux does (port 0x10, bit 0).
+//     Port 0x11 is NOT usable: on T2 it reads 3 for the dGPU but 0 (not 2) for the iGPU.
 //   - GmuxSwitchTo(): the full sequenced operation - power target up first,
-//     route panel + external, power the now-unused GPU down last. Never call
-//     GmuxSwitchDisplayRoute() alone; that is what caused the black screen.
+//     route DDC + panel + external, power the now-unused GPU down last. NOTE: the gmux.exe
+//     client no longer uses it (rail toggling from Windows hangs the machine, see README);
+//     it stays for IOCTL_GMUX_SWITCH_TO. Never call GmuxSwitchDisplayRoute() alone.
 //   - Boot default (replaces the old ForceIGD switch): `gmux -default` snapshots the
 //     current panel route into Parameters\DefaultRoute, and every time the device starts
 //     (every Windows boot) that route is re-applied. `gmux -i` / `gmux -d` therefore only
-//     last until the next reboot. dGPU default = rail on + route. iGPU default = route only;
-//     the rail is never cut at boot (the Radeon driver may already be running).
+//     last until the next reboot. Both defaults are route-only (DDC + panel + external);
+//     the rail is never touched at boot: the firmware has already powered the dGPU and the
+//     Radeon driver may be running.
 
 #include <ntddk.h>
 #include <wdf.h>
@@ -52,6 +62,10 @@ typedef struct _DEVICE_CONTEXT {
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetDeviceContext)
 
+// Registry Parameters\ExternalFollowsPanel = 1: also move the external DP mux with the panel
+// (Linux only does that on Macs without Thunderbolt). Default 0: external AUX stays on dGPU.
+static BOOLEAN g_ExternalFollowsPanel = FALSE;
+
 // ---- Prototypes ----
 DRIVER_INITIALIZE DriverEntry;
 EVT_WDF_DRIVER_DEVICE_ADD EvtDeviceAdd;
@@ -66,13 +80,16 @@ static BOOLEAN PollCommandClear(_In_ PUCHAR Base, _In_ ULONG TimeoutMs);
 _Success_(return) static BOOLEAN GmuxRead8(_In_ PUCHAR Base, _In_ UCHAR Port, _Out_ PUCHAR Value);
 static BOOLEAN GmuxWrite8(_In_ PUCHAR Base, _In_ UCHAR Port, _In_ UCHAR Value);
 static BOOLEAN GmuxSetDiscretePower(_In_ PUCHAR Base, _In_ BOOLEAN PowerOn, _In_ ULONG SettleMs);
+static BOOLEAN GmuxSwitchDdc(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete);
 static BOOLEAN GmuxSwitchDisplayRoute(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete);
 static BOOLEAN GmuxSwitchExternalRoute(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete);
 static BOOLEAN GmuxSwitchAllRoutes(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete);
 static BOOLEAN GmuxSwitchTo(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete);
+_Success_(return) static BOOLEAN GmuxReadPanelRoute(_In_ PUCHAR Base, _Out_ PUCHAR Route);
 _Success_(return) static BOOLEAN GmuxReadVersion(_In_ PUCHAR Base, _Out_ PUCHAR Major, _Out_ PUCHAR Minor, _Out_ PUCHAR Release);
 static BOOLEAN GmuxDetect(_In_ PUCHAR Base);
 static UCHAR    ReadDefaultRoute(_In_ WDFDRIVER Driver);
+static BOOLEAN  ReadParameterFlag(_In_ WDFDRIVER Driver, _In_ PCWSTR Name);
 static NTSTATUS WriteDefaultRoute(_In_ WDFDRIVER Driver, _In_ UCHAR Route);
 static VOID     ApplyDefaultRoute(_In_ PUCHAR Base, _In_ UCHAR Route);
 
@@ -130,7 +147,41 @@ GmuxSetDiscretePower(_In_ PUCHAR Base, _In_ BOOLEAN PowerOn, _In_ ULONG SettleMs
     KeDelayExecutionThread(KernelMode, FALSE, &interval);
 
     DbgPrint("[Gmux] Discrete power %s: %d\n", PowerOn ? "ON" : "OFF", ok);
+
+    // Diagnostics only (NOT cleared here: the ACPI GPE handler may own this register).
+    // Linux waits for GMUX_INTERRUPT_STATUS_POWER (bit 2) via the GPE; if it never shows up
+    // here, the fixed delay above is not a real completion signal.
+    {
+        UCHAR st = 0;
+        if (GmuxRead8(Base, GMUX_PORT_INTERRUPT_STATUS, &st)) {
+            DbgPrint("[Gmux] interrupt status after power change = 0x%02X (bit 2 = power done)\n", st);
+        } else {
+            DbgPrint("[Gmux] interrupt status read failed after power change\n");
+        }
+    }
     return ok;
+}
+
+// ---- Panel DDC/AUX line (port 0x28): 1 = iGPU, 2 = dGPU (NOT the 2/3 of ports 0x10/0x40) ----
+static BOOLEAN
+GmuxSwitchDdc(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete)
+{
+    BOOLEAN ok = GmuxWrite8(Base, GMUX_PORT_SWITCH_DDC, ToDiscrete ? GMUX_DDC_DGPU : GMUX_DDC_IGD);
+    DbgPrint("[Gmux] DDC route -> %s: %d\n", ToDiscrete ? "dGPU" : "iGPU", ok);
+    return ok;
+}
+
+// ---- Current panel route, as Linux gmux_read_switch_state(): port 0x10, bit 0 ----
+// bit 0 set = dGPU, clear = iGPU (observed on hardware: 0x05 = dGPU, 0x04 = iGPU).
+_Success_(return)
+static BOOLEAN
+GmuxReadPanelRoute(_In_ PUCHAR Base, _Out_ PUCHAR Route)
+{
+    UCHAR raw = 0;
+    *Route = 0;
+    if (!GmuxRead8(Base, GMUX_PORT_SWITCH_DISPLAY, &raw)) return FALSE;
+    *Route = (raw & 1) ? GMUX_ROUTE_DGPU : GMUX_ROUTE_IGD;
+    return TRUE;
 }
 
 // ---- Panel route only (mirrors gmux_switchto) ----
@@ -151,15 +202,23 @@ GmuxSwitchExternalRoute(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete)
     return ok;
 }
 
-// ---- Panel + external, in the same order as Linux gmux_switchto() ----
-// The result is the PANEL write. A failed external write is logged but not fatal: it must
-// not stop the caller from powering the right GPU, and models without an external mux
-// may simply not acknowledge it.
+// ---- DDC + panel + external, in the same order as Linux gmux_switchto() ----
+// The result is the PANEL write. A failed DDC or external write is logged but not fatal: it
+// must not stop the caller from powering the right GPU, and models without such a mux may
+// simply not acknowledge it.
+// External mux: follows the panel only if ExternalFollowsPanel is set; otherwise it is forced
+// to the dGPU like Linux does on Thunderbolt Macs.
 static BOOLEAN
 GmuxSwitchAllRoutes(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete)
 {
+    BOOLEAN ddcOk = GmuxSwitchDdc(Base, ToDiscrete);
     BOOLEAN ok = GmuxSwitchDisplayRoute(Base, ToDiscrete);
-    if (!GmuxSwitchExternalRoute(Base, ToDiscrete)) {
+    BOOLEAN extToDiscrete = g_ExternalFollowsPanel ? ToDiscrete : TRUE;
+
+    if (!ddcOk) {
+        DbgPrint("[Gmux] WARNING: DDC route write did not complete (panel result: %d)\n", ok);
+    }
+    if (!GmuxSwitchExternalRoute(Base, extToDiscrete)) {
         DbgPrint("[Gmux] WARNING: external route write did not complete (panel result: %d)\n", ok);
     }
     return ok;
@@ -257,6 +316,27 @@ ReadDefaultRoute(_In_ WDFDRIVER Driver)
     return (value == GMUX_ROUTE_IGD || value == GMUX_ROUTE_DGPU) ? (UCHAR)value : 0;
 }
 
+// REG_DWORD under Parameters; missing or 0 = FALSE, anything else = TRUE.
+static BOOLEAN
+ReadParameterFlag(_In_ WDFDRIVER Driver, _In_ PCWSTR Name)
+{
+    BOOLEAN result = FALSE;
+    WDFKEY key;
+
+    if (NT_SUCCESS(WdfDriverOpenParametersRegistryKey(Driver, KEY_READ,
+                                                       WDF_NO_OBJECT_ATTRIBUTES, &key))) {
+        UNICODE_STRING valName;
+        ULONG readVal;
+
+        RtlInitUnicodeString(&valName, Name);
+        if (NT_SUCCESS(WdfRegistryQueryULong(key, &valName, &readVal))) {
+            result = (BOOLEAN)(readVal != 0);
+        }
+        WdfRegistryClose(key);
+    }
+    return result;
+}
+
 // Route 0 deletes the stored default.
 static NTSTATUS
 WriteDefaultRoute(_In_ WDFDRIVER Driver, _In_ UCHAR Route)
@@ -286,44 +366,28 @@ WriteDefaultRoute(_In_ WDFDRIVER Driver, _In_ UCHAR Route)
 // Applied from EvtDevicePrepareHardware, i.e. before/while display drivers start - the same
 // "route first, modeset afterwards" order Linux gets from apple-gmux probing before i915.
 //
-// The panel mux and the external DP mux are independent, so each is compared with the target
-// on its own. The disruptive part (rail toggle / panel route write while the boot logo's
-// framebuffer is live, before the real GPU driver could retrain the link) only happens when
-// the PANEL is not already on the target. If the panel is fine and only the external mux is
-// off-target, just the external mux is written - that cannot affect the internal panel.
+// Route-only for BOTH targets: at boot the firmware has already powered the dGPU (port 0x50
+// reads 3) and a Radeon driver may be starting, so the power rail is never written here (the
+// old dGPU path went through GmuxSwitchTo() and wrote the rail while the GPU was up). The
+// current panel route is read from port 0x10 bit 0, like Linux. If the panel is already on
+// the target nothing is written at all.
 static VOID
 ApplyDefaultRoute(_In_ PUCHAR Base, _In_ UCHAR Route)
 {
     UCHAR curPanel = 0;
-    UCHAR curExt = 0;
-    BOOLEAN havePanel = GmuxRead8(Base, GMUX_PORT_SWITCH_GET_DISPLAY, &curPanel);
-    BOOLEAN haveExt = GmuxRead8(Base, GMUX_PORT_SWITCH_GET_EXTERNAL, &curExt);
+    BOOLEAN havePanel = GmuxReadPanelRoute(Base, &curPanel);
     BOOLEAN toDiscrete = (BOOLEAN)(Route == GMUX_ROUTE_DGPU);
 
-    DbgPrint("[Gmux] Boot default = %s, panel route = %s, external route = %s\n",
+    DbgPrint("[Gmux] Boot default = %s, panel route = %s\n",
              toDiscrete ? "dGPU" : "iGPU",
-             havePanel ? (curPanel == GMUX_ROUTE_DGPU ? "dGPU" :
-                          curPanel == GMUX_ROUTE_IGD  ? "iGPU" : "?") : "<read failed>",
-             haveExt ? (curExt == GMUX_ROUTE_DGPU ? "dGPU" :
-                        curExt == GMUX_ROUTE_IGD  ? "iGPU" : "?") : "<read failed>");
+             havePanel ? (curPanel == GMUX_ROUTE_DGPU ? "dGPU" : "iGPU") : "<read failed>");
 
     if (havePanel && curPanel == Route) {
-        // Panel already on target: leave it (and the power rail) alone.
-        if (!haveExt || curExt != Route) {
-            GmuxSwitchExternalRoute(Base, toDiscrete);
-        }
+        DbgPrint("[Gmux] Boot default: panel already on target - nothing written\n");
         return;
     }
 
-    if (toDiscrete) {
-        // Rail state can't be read back (Linux never reads port 0x50), so if the panel is not
-        // on the dGPU go through the full sequence (rail may have been left off by an earlier
-        // session). GmuxSwitchTo also writes the external mux.
-        GmuxSwitchTo(Base, TRUE);
-    } else {
-        // iGPU: routes only - never cut the rail at boot.
-        GmuxSwitchAllRoutes(Base, FALSE);
-    }
+    GmuxSwitchAllRoutes(Base, toDiscrete);
 }
 
 // ---- DriverEntry ----
@@ -419,6 +483,9 @@ EvtDevicePrepareHardware(
 
     context->Mapped = TRUE;
     DbgPrint("[Gmux] MMIO mapped, version check passed\n");
+
+    g_ExternalFollowsPanel = ReadParameterFlag(WdfGetDriver(), L"ExternalFollowsPanel");
+    DbgPrint("[Gmux] ExternalFollowsPanel = %d\n", g_ExternalFollowsPanel);
 
     // Boot default (Parameters\DefaultRoute, written by `gmux -default`). Applied once per
     // device object, not again on a PnP stop/start rebalance.
@@ -641,9 +708,9 @@ EvtIoDeviceControl(
         resp->Success = FALSE;
         bytesReturned = sizeof(GMUX_DEFAULT_RESPONSE);
 
-        // Snapshot the live hardware value; refuse to store anything that is not a real route.
-        if (GmuxRead8(context->MappedBase, GMUX_PORT_SWITCH_GET_DISPLAY, &cur) &&
-            (cur == GMUX_ROUTE_IGD || cur == GMUX_ROUTE_DGPU)) {
+        // Snapshot the live hardware value (port 0x10 bit 0, like Linux; port 0x11 reads 0
+        // for the iGPU on T2 and would make an iGPU default impossible to store).
+        if (GmuxReadPanelRoute(context->MappedBase, &cur)) {
             if (NT_SUCCESS(WriteDefaultRoute(WdfGetDriver(), cur))) {
                 resp->Route = cur;
                 resp->Success = TRUE;
