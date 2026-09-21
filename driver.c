@@ -40,15 +40,17 @@ EVT_WDF_DRIVER_DEVICE_ADD EvtDeviceAdd;
 EVT_WDF_OBJECT_CONTEXT_CLEANUP EvtDeviceContextCleanup;
 EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL EvtIoDeviceControl;
 
-static BOOLEAN PollCommandClear(PUCHAR Base, ULONG TimeoutMs);
-static BOOLEAN GmuxRead8(PUCHAR Base, UCHAR Port, PUCHAR Value);
-static BOOLEAN GmuxWrite8(PUCHAR Base, UCHAR Port, UCHAR Value);
-static BOOLEAN GmuxSetDiscretePower(PUCHAR Base, BOOLEAN PowerOn, ULONG SettleMs);
-static BOOLEAN GmuxSwitchDisplayRoute(PUCHAR Base, BOOLEAN ToDiscrete);
-static BOOLEAN GmuxSwitchTo(PUCHAR Base, BOOLEAN ToDiscrete);
-static NTSTATUS EnsureMapped(PDEVICE_CONTEXT Context);
-static BOOLEAN GmuxDetect(PUCHAR Base);
-static ULONG   ReadForceIgdSetting(WDFDRIVER Driver);
+// Prototypes carry the same SAL annotations as the definitions - PREfast (C28301)
+// requires the FIRST declaration to be annotated.
+static BOOLEAN PollCommandClear(_In_ PUCHAR Base, _In_ ULONG TimeoutMs);
+_Success_(return) static BOOLEAN GmuxRead8(_In_ PUCHAR Base, _In_ UCHAR Port, _Out_ PUCHAR Value);
+static BOOLEAN GmuxWrite8(_In_ PUCHAR Base, _In_ UCHAR Port, _In_ UCHAR Value);
+static BOOLEAN GmuxSetDiscretePower(_In_ PUCHAR Base, _In_ BOOLEAN PowerOn, _In_ ULONG SettleMs);
+static BOOLEAN GmuxSwitchDisplayRoute(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete);
+static BOOLEAN GmuxSwitchTo(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete);
+static NTSTATUS EnsureMapped(_In_ PDEVICE_CONTEXT Context);
+static BOOLEAN GmuxDetect(_In_ PUCHAR Base);
+static ULONG   ReadForceIgdSetting(_In_ WDFDRIVER Driver);
 
 // ---- Wait for command register to clear ----
 static BOOLEAN
@@ -67,6 +69,7 @@ PollCommandClear(_In_ PUCHAR Base, _In_ ULONG TimeoutMs)
 }
 
 // ---- Read8 per protocol ----
+_Success_(return)
 static BOOLEAN
 GmuxRead8(_In_ PUCHAR Base, _In_ UCHAR Port, _Out_ PUCHAR Value)
 {
@@ -276,7 +279,7 @@ EvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
 
     // ForceIGD-on-load, mirroring Linux apple_gmux.force_igd=1. Uses the
     // full sequenced GmuxSwitchTo(), not a raw display-route-only write.
-    if (NT_SUCCESS(EnsureMapped(context))) {
+    if (NT_SUCCESS(EnsureMapped(context)) && context->MappedBase != NULL) {
         ULONG forceIgd = ReadForceIgdSetting(Driver);
         if (forceIgd) {
             GmuxSwitchTo(context->MappedBase, FALSE); // FALSE = route to iGPU
@@ -307,8 +310,9 @@ EvtIoDeviceControl(
     size_t bytesReturned = 0;
 
     status = EnsureMapped(context);
-    if (!NT_SUCCESS(status)) {
-        WdfRequestCompleteWithInformation(Request, status, 0);
+    if (!NT_SUCCESS(status) || context->MappedBase == NULL) {
+        WdfRequestCompleteWithInformation(Request,
+                                          NT_SUCCESS(status) ? STATUS_DEVICE_NOT_CONNECTED : status, 0);
         return;
     }
 
