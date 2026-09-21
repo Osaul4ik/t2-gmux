@@ -12,6 +12,19 @@
 //   POWER - dGPU power rail only (GMUX_POWER_REQUEST/RESPONSE)
 #define IOCTL_GMUX_ROUTE     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_GMUX_POWER     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
+// Boot default. The driver keeps the panel route in
+//   HKLM\SYSTEM\CurrentControlSet\Services\<service>\Parameters\DefaultRoute
+// and re-applies it every time the gmux device starts (= every Windows boot).
+//   SET_DEFAULT   - read the CURRENT route from the hardware and store it as the default
+//   GET_DEFAULT   - report the stored default (Route 0 = none stored)
+//   CLEAR_DEFAULT - delete the stored default
+#define IOCTL_GMUX_SET_DEFAULT   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_GMUX_GET_DEFAULT   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_GMUX_CLEAR_DEFAULT CTL_CODE(FILE_DEVICE_UNKNOWN, 0x807, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+// Route values are the same numbers gmux uses on ports 0x10 / 0x11.
+#define GMUX_ROUTE_IGD   2
+#define GMUX_ROUTE_DGPU  3
 
 typedef struct _GMUX_READ_REQUEST {
     UCHAR Port;
@@ -48,6 +61,12 @@ typedef struct _GMUX_POWER_REQUEST {
 typedef struct _GMUX_POWER_RESPONSE {
     BOOLEAN Success;
 } GMUX_POWER_RESPONSE, *PGMUX_POWER_RESPONSE;
+
+// Route: 0 = no default stored, GMUX_ROUTE_IGD or GMUX_ROUTE_DGPU otherwise
+typedef struct _GMUX_DEFAULT_RESPONSE {
+    UCHAR   Route;
+    BOOLEAN Success;
+} GMUX_DEFAULT_RESPONSE, *PGMUX_DEFAULT_RESPONSE;
 
 // Full gmux port map, from Linux include/linux/apple-gmux.h
 #define GMUX_PORT_VERSION_MAJOR    0x04

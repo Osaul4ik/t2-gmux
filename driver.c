@@ -19,8 +19,11 @@
 //   - GmuxSwitchTo(): the full sequenced operation - power target up first,
 //     route the panel, power the now-unused GPU down last. Never call
 //     GmuxSwitchDisplayRoute() alone; that is what caused the black screen.
-//   - ForceIGD-on-load (opt-in via the Parameters key, default 0), modelled on the
-//     out-of-tree t2linux apple_gmux.force_igd patch (not in mainline Linux).
+//   - Boot default (replaces the old ForceIGD switch): `gmux -default` snapshots the
+//     current panel route into Parameters\DefaultRoute, and every time the device starts
+//     (every Windows boot) that route is re-applied. `gmux -i` / `gmux -d` therefore only
+//     last until the next reboot. dGPU default = rail on + route. iGPU default = route only;
+//     the rail is never cut at boot (the Radeon driver may already be running).
 
 #include <ntddk.h>
 #include <wdf.h>
@@ -40,7 +43,7 @@
 typedef struct _DEVICE_CONTEXT {
     PUCHAR  MappedBase;
     BOOLEAN Mapped;
-    BOOLEAN ForceIgdApplied;
+    BOOLEAN DefaultApplied;
 } DEVICE_CONTEXT, *PDEVICE_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, GetDeviceContext)
@@ -63,7 +66,9 @@ static BOOLEAN GmuxSwitchDisplayRoute(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete)
 static BOOLEAN GmuxSwitchTo(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete);
 _Success_(return) static BOOLEAN GmuxReadVersion(_In_ PUCHAR Base, _Out_ PUCHAR Major, _Out_ PUCHAR Minor, _Out_ PUCHAR Release);
 static BOOLEAN GmuxDetect(_In_ PUCHAR Base);
-static ULONG   ReadForceIgdSetting(_In_ WDFDRIVER Driver);
+static UCHAR    ReadDefaultRoute(_In_ WDFDRIVER Driver);
+static NTSTATUS WriteDefaultRoute(_In_ WDFDRIVER Driver, _In_ UCHAR Route);
+static VOID     ApplyDefaultRoute(_In_ PUCHAR Base, _In_ UCHAR Route);
 
 // ---- Wait for command register to clear ----
 static BOOLEAN
@@ -200,14 +205,10 @@ GmuxDetect(_In_ PUCHAR Base)
     return TRUE;
 }
 
-// ---- Read ForceIGD DWORD from the driver's Parameters registry key ----
-// HKLM\SYSTEM\CurrentControlSet\Services\<ServiceName>\Parameters\ForceIGD
-// Default 0 (off). The t2linux force_igd patch only routes the panel and first checks
-// that the Intel iGPU is present; this driver's GmuxSwitchTo(FALSE) also cuts the
-// dGPU power rail, which is unsafe while the Radeon driver is running. Use the
-// gmux.exe client (`gmux i`) for a sequenced switch; set ForceIGD=1 only to opt in.
-static ULONG
-ReadForceIgdSetting(_In_ WDFDRIVER Driver)
+// ---- Boot default: HKLM\SYSTEM\CurrentControlSet\Services\<service>\Parameters\DefaultRoute ----
+// REG_DWORD, 2 = iGPU, 3 = dGPU. Missing or any other value = no default (driver touches nothing).
+static UCHAR
+ReadDefaultRoute(_In_ WDFDRIVER Driver)
 {
     ULONG value = 0;
     WDFKEY key;
@@ -217,15 +218,66 @@ ReadForceIgdSetting(_In_ WDFDRIVER Driver)
         UNICODE_STRING valName;
         ULONG readVal;
 
-        RtlInitUnicodeString(&valName, L"ForceIGD");
-
+        RtlInitUnicodeString(&valName, L"DefaultRoute");
         if (NT_SUCCESS(WdfRegistryQueryULong(key, &valName, &readVal))) {
             value = readVal;
         }
         WdfRegistryClose(key);
     }
 
-    return value;
+    return (value == GMUX_ROUTE_IGD || value == GMUX_ROUTE_DGPU) ? (UCHAR)value : 0;
+}
+
+// Route 0 deletes the stored default.
+static NTSTATUS
+WriteDefaultRoute(_In_ WDFDRIVER Driver, _In_ UCHAR Route)
+{
+    WDFKEY key;
+    UNICODE_STRING valName;
+    NTSTATUS status = WdfDriverOpenParametersRegistryKey(Driver, KEY_READ | KEY_WRITE,
+                                                         WDF_NO_OBJECT_ATTRIBUTES, &key);
+    if (!NT_SUCCESS(status)) {
+        return status;
+    }
+
+    RtlInitUnicodeString(&valName, L"DefaultRoute");
+    if (Route == 0) {
+        status = WdfRegistryRemoveValue(key, &valName);
+        if (status == STATUS_OBJECT_NAME_NOT_FOUND) {
+            status = STATUS_SUCCESS;
+        }
+    } else {
+        status = WdfRegistryAssignULong(key, &valName, Route);
+    }
+
+    WdfRegistryClose(key);
+    return status;
+}
+
+// Applied from EvtDevicePrepareHardware, i.e. before/while display drivers start - the same
+// "route first, modeset afterwards" order Linux gets from apple-gmux probing before i915.
+static VOID
+ApplyDefaultRoute(_In_ PUCHAR Base, _In_ UCHAR Route)
+{
+    UCHAR current = 0;
+    BOOLEAN haveCurrent = GmuxRead8(Base, GMUX_PORT_SWITCH_GET_DISPLAY, &current);
+
+    DbgPrint("[Gmux] Boot default = %s, current route = %s\n",
+             Route == GMUX_ROUTE_DGPU ? "dGPU" : "iGPU",
+             haveCurrent ? (current == GMUX_ROUTE_DGPU ? "dGPU" :
+                            current == GMUX_ROUTE_IGD  ? "iGPU" : "?") : "<read failed>");
+
+    if (Route == GMUX_ROUTE_DGPU) {
+        // The rail state cannot be read back (Linux never reads port 0x50), so power the
+        // dGPU on unconditionally: a previous session may have left it off with the route
+        // still pointing at the iGPU. GmuxSwitchTo(TRUE) = rail on, then route.
+        GmuxSwitchTo(Base, TRUE);
+    } else if (Route == GMUX_ROUTE_IGD) {
+        // Route only - never cut the rail at boot.
+        if (!haveCurrent || current != GMUX_ROUTE_IGD) {
+            GmuxSwitchDisplayRoute(Base, FALSE);
+        }
+    }
 }
 
 // ---- DriverEntry ----
@@ -322,14 +374,16 @@ EvtDevicePrepareHardware(
     context->Mapped = TRUE;
     DbgPrint("[Gmux] MMIO mapped, version check passed\n");
 
-    // Opt-in ForceIGD-on-load (Parameters\ForceIGD=1, default off), modelled on the
-    // t2linux force_igd patch. Uses the full sequenced GmuxSwitchTo(). Applied once
-    // per device object, not again on a PnP stop/start rebalance.
-    if (!context->ForceIgdApplied) {
-        context->ForceIgdApplied = TRUE;
-        if (ReadForceIgdSetting(WdfGetDriver())) {
-            GmuxSwitchTo(context->MappedBase, FALSE);   // FALSE = route to iGPU
-            DbgPrint("[Gmux] ForceIGD applied at load\n");
+    // Boot default (Parameters\DefaultRoute, written by `gmux -default`). Applied once per
+    // device object, not again on a PnP stop/start rebalance.
+    if (!context->DefaultApplied) {
+        UCHAR route;
+        context->DefaultApplied = TRUE;
+        route = ReadDefaultRoute(WdfGetDriver());
+        if (route != 0) {
+            ApplyDefaultRoute(context->MappedBase, route);
+        } else {
+            DbgPrint("[Gmux] No boot default stored - route left as the firmware set it\n");
         }
     }
 
@@ -402,7 +456,7 @@ EvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
     context = GetDeviceContext(device);
     context->MappedBase = NULL;
     context->Mapped = FALSE;
-    context->ForceIgdApplied = FALSE;
+    context->DefaultApplied = FALSE;
 
     WDF_IO_QUEUE_CONFIG_INIT_DEFAULT_QUEUE(&queueConfig, WdfIoQueueDispatchSequential);
     queueConfig.EvtIoDeviceControl = EvtIoDeviceControl;
@@ -410,7 +464,7 @@ EvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
     status = WdfIoQueueCreate(device, &queueConfig, WDF_NO_OBJECT_ATTRIBUTES, &queue);
     if (!NT_SUCCESS(status)) return status;
 
-    // MMIO mapping and ForceIGD happen in EvtDevicePrepareHardware.
+    // MMIO mapping and the boot default (DefaultRoute) happen in EvtDevicePrepareHardware.
 
     return STATUS_SUCCESS;
 }
@@ -514,6 +568,50 @@ EvtIoDeviceControl(
 
         resp->Success = GmuxSetDiscretePower(context->MappedBase, req->PowerOn, 250);
         bytesReturned = sizeof(GMUX_POWER_RESPONSE);
+        break;
+    }
+    case IOCTL_GMUX_SET_DEFAULT: {
+        PGMUX_DEFAULT_RESPONSE resp = NULL;
+        UCHAR cur = 0;
+
+        status = WdfRequestRetrieveOutputBuffer(Request, sizeof(GMUX_DEFAULT_RESPONSE), (PVOID*)&resp, NULL);
+        if (!NT_SUCCESS(status)) break;
+
+        resp->Route = 0;
+        resp->Success = FALSE;
+        bytesReturned = sizeof(GMUX_DEFAULT_RESPONSE);
+
+        // Snapshot the live hardware value; refuse to store anything that is not a real route.
+        if (GmuxRead8(context->MappedBase, GMUX_PORT_SWITCH_GET_DISPLAY, &cur) &&
+            (cur == GMUX_ROUTE_IGD || cur == GMUX_ROUTE_DGPU)) {
+            if (NT_SUCCESS(WriteDefaultRoute(WdfGetDriver(), cur))) {
+                resp->Route = cur;
+                resp->Success = TRUE;
+            }
+        }
+        DbgPrint("[Gmux] SET_DEFAULT route=%u success=%d\n", cur, resp->Success);
+        break;
+    }
+    case IOCTL_GMUX_GET_DEFAULT: {
+        PGMUX_DEFAULT_RESPONSE resp = NULL;
+
+        status = WdfRequestRetrieveOutputBuffer(Request, sizeof(GMUX_DEFAULT_RESPONSE), (PVOID*)&resp, NULL);
+        if (!NT_SUCCESS(status)) break;
+
+        resp->Route = ReadDefaultRoute(WdfGetDriver());
+        resp->Success = TRUE;
+        bytesReturned = sizeof(GMUX_DEFAULT_RESPONSE);
+        break;
+    }
+    case IOCTL_GMUX_CLEAR_DEFAULT: {
+        PGMUX_DEFAULT_RESPONSE resp = NULL;
+
+        status = WdfRequestRetrieveOutputBuffer(Request, sizeof(GMUX_DEFAULT_RESPONSE), (PVOID*)&resp, NULL);
+        if (!NT_SUCCESS(status)) break;
+
+        resp->Route = 0;
+        resp->Success = NT_SUCCESS(WriteDefaultRoute(WdfGetDriver(), 0)) ? TRUE : FALSE;
+        bytesReturned = sizeof(GMUX_DEFAULT_RESPONSE);
         break;
     }
     default:

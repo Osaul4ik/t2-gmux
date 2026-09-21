@@ -1,5 +1,8 @@
 // gmux.cpp - console client for GmuxCtl (run as Administrator).
 //
+//   gmux -default         store the CURRENT panel route as the boot default; the driver re-applies
+//                          it on every Windows boot. `gmux -default clear` removes it.
+//                          `gmux -i` / `gmux -d` below only last until the next reboot.
 //   gmux i | -i            full switch to Intel:  route panel -> iGPU, disable Radeon in
 //                          PnP, THEN cut the dGPU power rail. Aborts before any power-off
 //                          step whose precondition is not verified.
@@ -7,6 +10,10 @@
 //                          THEN route panel -> dGPU. Never touches the Intel adapter.
 //
 // Individual steps, for testing one thing at a time:
+//   gmux trial [sec]       SAFE TEST: route panel -> iGPU and restart the Intel adapter so it
+//                          re-detects the panel. Radeon stays enabled and powered. Unless a key
+//                          is pressed within [sec] (default 20) the panel is routed back to the
+//                          dGPU automatically - no reboot needed if the screen stays black.
 //   gmux status            gmux version, raw route/power ports, Intel + Radeon PnP state
 //   gmux route i|d         panel route only
 //   gmux power on|off      dGPU power rail only (WARNING: off while the Radeon driver is
@@ -23,6 +30,7 @@
 #include <string.h>
 #include <wchar.h>
 #include <wctype.h>
+#include <conio.h>
 #include "public.h"   // shared IOCTL/struct definitions
 
 #pragma comment(lib, "setupapi.lib")
@@ -78,6 +86,17 @@ static bool Power(HANDLE h, bool on)
     GMUX_POWER_RESPONSE resp = { 0 };
     printf("  dGPU power rail -> %s ...\n", on ? "ON" : "OFF");
     return Ioctl(h, IOCTL_GMUX_POWER, &req, sizeof(req), &resp, sizeof(resp)) && resp.Success;
+}
+
+static bool DefaultIoctl(HANDLE h, DWORD code, GMUX_DEFAULT_RESPONSE* resp)
+{
+    ZeroMemory(resp, sizeof(*resp));
+    return Ioctl(h, code, NULL, 0, resp, sizeof(*resp)) && resp->Success;
+}
+
+static const char* RouteName(UCHAR r)
+{
+    return r == GMUX_ROUTE_DGPU ? "dGPU (Radeon)" : r == GMUX_ROUTE_IGD ? "iGPU (Intel)" : "(none)";
 }
 
 // ------------------------------------------------------------------- PnP side
@@ -243,6 +262,12 @@ static void CmdStatus(HANDLE h)
     PrintPort(h, GMUX_PORT_SWITCH_GET_DISPLAY, "get display (0x11)");
     PrintPort(h, GMUX_PORT_DISCRETE_POWER,     "discrete power (0x50)");
     printf("  (raw values - Linux never reads 0x50 back, so compare before/after a command)\n");
+    {
+        GMUX_DEFAULT_RESPONSE d;
+        if (DefaultIoctl(h, IOCTL_GMUX_GET_DEFAULT, &d)) {
+            printf("  boot default route              = %s\n", RouteName(d.Route));
+        }
+    }
     printf("adapters:\n");
     PrintGpu(L"Intel", VEN_INTEL);
     PrintGpu(L"Radeon", VEN_AMD);
@@ -317,11 +342,93 @@ static int CmdToRadeon(HANDLE h)
     return 0;
 }
 
+// Reversible test of the iGPU route. Never touches the Radeon PnP state or the power rail,
+// so the automatic revert (route -> dGPU) always has a live dGPU to go back to.
+static int CmdTrial(HANDLE h, DWORD seconds)
+{
+    printf("== trial: panel -> Intel for %lu s ==\n", seconds);
+
+    GpuInfo intel;
+    if (!QueryGpu(VEN_INTEL, &intel) || !GpuRunning(intel)) {
+        printf("ABORT: Intel adapter is not running (%ls) - install the Intel driver first.\n",
+               intel.found ? Describe(intel) : L"not present");
+        return 1;
+    }
+
+    if (!Route(h, false)) { printf("ABORT: route to iGPU failed.\n"); return 1; }
+    Sleep(1000);
+
+    // Linux order is "route first, THEN i915 initialises and trains the eDP link".
+    // Restarting the Intel adapter after the route approximates that: it makes the driver
+    // re-read the panel (EDID/DPCD) and redo link training on the newly attached display.
+    printf("  restarting Intel adapter so it re-detects the panel ...\n");
+    if (SetGpuState(VEN_INTEL, DICS_DISABLE)) WaitGpu(VEN_INTEL, true, 8000);
+    if (SetGpuState(VEN_INTEL, DICS_ENABLE))  WaitGpu(VEN_INTEL, false, 15000);
+
+    printf("  If you can read this on the panel, press any key within %lu s to KEEP the iGPU route.\n", seconds);
+    printf("  Otherwise the panel returns to the dGPU automatically.\n");
+
+    bool keep = false;
+    for (DWORD t = 0; t < seconds * 4; ++t) {
+        if (_kbhit()) { _getch(); keep = true; break; }
+        Sleep(250);
+    }
+
+    if (keep) {
+        printf("  kept: panel stays on Intel until the next reboot (Radeon still enabled and powered).\n");
+        printf("  To make it permanent run `gmux -default`.\n");
+        CmdStatus(h);
+        return 0;
+    }
+
+    printf("  no confirmation - reverting to dGPU ...\n");
+    if (!Route(h, true)) { printf("FAILED: revert route write failed - run `gmux d`.\n"); return 1; }
+    CmdStatus(h);
+    return 2;
+}
+
+// Snapshot the current route as the boot default. An iGPU default is only accepted while the
+// Intel adapter is actually running - otherwise the next boot would come up on a dead panel.
+static int CmdDefault(HANDLE h, const char* arg)
+{
+    GMUX_DEFAULT_RESPONSE d;
+
+    if (!_stricmp(arg, "clear")) {
+        if (!DefaultIoctl(h, IOCTL_GMUX_CLEAR_DEFAULT, &d)) { printf("FAILED to clear the boot default.\n"); return 1; }
+        printf("Boot default cleared: the driver leaves the route as the firmware set it.\n");
+        return 0;
+    }
+
+    UCHAR cur = 0;
+    if (!Read8(h, GMUX_PORT_SWITCH_GET_DISPLAY, &cur)) { printf("ABORT: cannot read the current route.\n"); return 1; }
+    printf("current route (port 0x11) = 0x%02X -> %s\n", cur, RouteName(cur));
+
+    if (cur != GMUX_ROUTE_IGD && cur != GMUX_ROUTE_DGPU) {
+        printf("ABORT: unrecognised route value, nothing stored.\n");
+        return 1;
+    }
+    if (cur == GMUX_ROUTE_IGD) {
+        GpuInfo intel;
+        if (!QueryGpu(VEN_INTEL, &intel) || !GpuRunning(intel)) {
+            printf("ABORT: refusing to store an iGPU default while the Intel adapter is not running.\n");
+            return 1;
+        }
+    }
+
+    if (!DefaultIoctl(h, IOCTL_GMUX_SET_DEFAULT, &d)) { printf("FAILED to store the boot default.\n"); return 1; }
+    printf("Boot default stored: %s. Applied by the driver on every boot.\n", RouteName(d.Route));
+    printf("(Scope: panel route only. Port 0x50 cannot be read back, and brightness is owned by Windows.)\n");
+    return 0;
+}
+
 static void Usage()
 {
     printf("Usage (Administrator):\n"
            "  gmux i | d                 full switch to Intel / Radeon (-i / -d also accepted)\n"
+           "  gmux -default [clear]      store current route as boot default / remove it\n"
+           "                             (i and d below last only until the next reboot)\n"
            "  gmux status                ports + Intel/Radeon PnP state\n"
+           "  gmux trial [sec]           reversible iGPU test, auto-reverts to dGPU (default 20 s)\n"
            "  gmux route i|d             panel route only\n"
            "  gmux power on|off          dGPU power rail only\n"
            "  gmux amd disable|enable    PnP disable/enable of the Radeon\n"
@@ -358,6 +465,12 @@ int main(int argc, char** argv)
     if (!_stricmp(cmd, "i"))            rc = CmdToIntel(h);
     else if (!_stricmp(cmd, "d"))       rc = CmdToRadeon(h);
     else if (!_stricmp(cmd, "status"))  { CmdStatus(h); rc = 0; }
+    else if (!_stricmp(cmd, "default")) rc = CmdDefault(h, a2);
+    else if (!_stricmp(cmd, "trial")) {
+        DWORD sec = *a2 ? (DWORD)strtoul(a2, NULL, 10) : 20;
+        if (sec < 5 || sec > 300) sec = 20;
+        rc = CmdTrial(h, sec);
+    }
     else if (!_stricmp(cmd, "route") && (*a2 == 'i' || *a2 == 'I' || *a2 == 'd' || *a2 == 'D')) {
         rc = Route(h, *a2 == 'd' || *a2 == 'D') ? 0 : 1;
         CmdStatus(h);
