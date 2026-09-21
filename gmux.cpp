@@ -27,8 +27,9 @@
 //   gmux amd disable|enable   PnP disable/enable of the Radeon display adapter (disable is NOT
 //                          persistent across reboots)
 //   gmux read <hexport>    raw 8-bit read of a gmux port, e.g. `gmux read 50`
-//   gmux write <hexport> <hexval>   raw 8-bit write, e.g. `gmux write 28 1` (DDC -> iGPU). Port 0x50
-//                          is refused here, use `gmux power`.
+//   gmux write <hexport> <hexval>   raw 8-bit write, e.g. `gmux write 16 1D`. Port 0x50 is refused
+//                          here, use `gmux power`.
+//   gmux efi               READ-ONLY: firmware boot GPU preference (gpu-power-prefs), no driver needed
 
 #include <windows.h>
 #include <setupapi.h>
@@ -332,9 +333,10 @@ static void CmdStatus(HANDLE h)
     PrintPort(h, GMUX_PORT_SWITCH_EXTERNAL,    "switch external (0x40)");
     PrintPort(h, GMUX_PORT_SWITCH_GET_EXTERNAL,"get external (0x41)");
     PrintPort(h, GMUX_PORT_DISCRETE_POWER,     "discrete power (0x50)");
+    PrintPort(h, GMUX_PORT_INTERRUPT_ENABLE,   "interrupt enable (0x14)");
     PrintPort(h, GMUX_PORT_INTERRUPT_STATUS,   "interrupt status (0x16)");
     printf("  (0x11/0x41 are informational; 0x50 cannot be read back - compare before/after a command;\n"
-           "   0x16 bit 2 = power change done)\n");
+           "   0x16 sits at a constant 0x1D on this machine because nothing acknowledges it)\n");
     {
         GMUX_DEFAULT_RESPONSE d;
         if (DefaultIoctl(h, IOCTL_GMUX_GET_DEFAULT, &d)) {
@@ -519,6 +521,51 @@ static int CmdDefault(HANDLE h, const char* arg)
     return 0;
 }
 
+// READ-ONLY look at the EFI variable the Mac firmware uses to pick the boot GPU
+// (gpu-power-prefs-fa4ce28d-b62f-4c99-9cc3-6815686e30f9; first data byte 1 = iGPU, 0 = dGPU - see the
+// apple-gmux.c documentation and 0xbb/gpu-switch). At boot the firmware itself routes the panel and
+// gives the chosen GPU a framebuffer, which is the only iGPU path known to work on T2 (see README).
+// This tool never writes it: use gpu-switch for that, and read the README first.
+static int CmdEfi()
+{
+    HANDLE tok = NULL;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &tok)) {
+        TOKEN_PRIVILEGES tp;
+        ZeroMemory(&tp, sizeof(tp));
+        tp.PrivilegeCount = 1;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        if (LookupPrivilegeValueW(NULL, L"SeSystemEnvironmentPrivilege", &tp.Privileges[0].Luid)) {
+            AdjustTokenPrivileges(tok, FALSE, &tp, 0, NULL, NULL);
+        }
+        CloseHandle(tok);
+    }
+
+    typedef DWORD (WINAPI *PFN_GetFwVarEx)(LPCWSTR, LPCWSTR, PVOID, DWORD, PDWORD);
+    FARPROC proc = GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetFirmwareEnvironmentVariableExW");
+    PFN_GetFwVarEx fn = reinterpret_cast<PFN_GetFwVarEx>(reinterpret_cast<void*>(proc));
+    if (!fn) { printf("GetFirmwareEnvironmentVariableExW is not available on this Windows.\n"); return 1; }
+
+    BYTE buf[64] = { 0 };
+    DWORD attr = 0;
+    DWORD n = fn(L"gpu-power-prefs", L"{FA4CE28D-B62F-4C99-9CC3-6815686E30F9}", buf, sizeof(buf), &attr);
+    if (n == 0) {
+        DWORD e = GetLastError();
+        if (e == ERROR_ENVVAR_NOT_FOUND) {
+            printf("gpu-power-prefs: not set (the firmware uses its default: dGPU).\n");
+            return 0;
+        }
+        printf("gpu-power-prefs: cannot read (error %lu)%s\n", e,
+               e == ERROR_INVALID_FUNCTION ? " - Windows is not booted in UEFI mode." :
+               e == ERROR_PRIVILEGE_NOT_HELD ? " - run as Administrator." : ".");
+        return 1;
+    }
+    printf("gpu-power-prefs: %lu byte(s), attributes 0x%lX, data:", n, attr);
+    for (DWORD i = 0; i < n; ++i) printf(" %02X", buf[i]);
+    printf("\n  first byte %02X -> firmware boot GPU: %s\n", buf[0],
+           buf[0] == 1 ? "iGPU (Intel)" : buf[0] == 0 ? "dGPU (Radeon)" : "(unrecognised)");
+    return 0;
+}
+
 static void Usage()
 {
     printf("Usage (Administrator):\n"
@@ -535,7 +582,9 @@ static void Usage()
            "  gmux power on|off          dGPU power rail only (dangerous, see README)\n"
            "  gmux amd disable|enable    PnP disable/enable of the Radeon (disable is not persistent)\n"
            "  gmux read <hexport>        raw port read, e.g. gmux read 50\n"
-           "  gmux write <hexport> <hexval>   raw port write, e.g. gmux write 28 1\n");
+           "  gmux write <hexport> <hexval>   raw port write, e.g. gmux write 16 1D\n"
+           "  gmux efi                   READ-ONLY: show the firmware's boot GPU preference\n"
+           "                             (gpu-power-prefs EFI variable); no driver needed\n");
 }
 
 static const char* Arg(int argc, char** argv, int i)
@@ -550,6 +599,8 @@ int main(int argc, char** argv)
 {
     const char* cmd = Arg(argc, argv, 1);
     if (!*cmd || !_stricmp(cmd, "h") || !_stricmp(cmd, "help") || !_stricmp(cmd, "?")) { Usage(); return 1; }
+
+    if (!_stricmp(cmd, "efi")) return CmdEfi();   // needs no driver
 
     HANDLE h = OpenGmux();
     if (h == INVALID_HANDLE_VALUE) return 1;

@@ -15,11 +15,11 @@
 //     interrupt-based completion wait Linux uses is approximated with a
 //     fixed delay; Linux itself skips the wait when no GPE is found, so
 //     this is not worse than that fallback path).
-//   - GmuxSwitchDdc(): panel DDC/AUX line (port 0x28: 1 = iGPU, 2 = dGPU). Linux
-//     gmux_switchto() writes it for EVERY gmux type (gmux_write_switch_state() is not
-//     conditional); the old comment here claiming it is "classic PIO only" was wrong.
-//     Without it the panel's EDID/DPCD stays on the Radeon, so the Intel driver cannot
-//     read the panel and the screen stays black after the panel mux moved to the iGPU.
+//   - GmuxSwitchDdc(): panel DDC line (port 0x28: 1 = iGPU, 2 = dGPU). Linux
+//     gmux_switchto() writes it for EVERY gmux type, so it is written here too. MEASURED on
+//     this T2 gmux: port 0x28 reads 0x00 both before and after a write of 1, i.e. the write
+//     has no visible effect. Linux's own comment says retina/T2 machines cannot switch the
+//     panel's AUX separately, so this is NOT the cause of the black panel on the iGPU.
 //   - GmuxSwitchDisplayRoute(): panel mux only (port 0x10).
 //   - GmuxSwitchExternalRoute(): external DP mux only (port 0x40). Linux only follows the
 //     panel with this mux when no Thunderbolt controller is present; on Thunderbolt Macs
@@ -149,8 +149,9 @@ GmuxSetDiscretePower(_In_ PUCHAR Base, _In_ BOOLEAN PowerOn, _In_ ULONG SettleMs
     DbgPrint("[Gmux] Discrete power %s: %d\n", PowerOn ? "ON" : "OFF", ok);
 
     // Diagnostics only (NOT cleared here: the ACPI GPE handler may own this register).
-    // Linux waits for GMUX_INTERRUPT_STATUS_POWER (bit 2) via the GPE; if it never shows up
-    // here, the fixed delay above is not a real completion signal.
+    // MEASURED: at idle this reads a constant 0x1D (bits 0, 2, 3, 4) that nothing ever
+    // acknowledges - Linux clears it from its GPE handler - so bit 2 is already set and only a
+    // CHANGE of the value around a power command is informative.
     {
         UCHAR st = 0;
         if (GmuxRead8(Base, GMUX_PORT_INTERRUPT_STATUS, &st)) {
@@ -616,11 +617,14 @@ EvtIoDeviceControl(
         status = WdfRequestRetrieveOutputBuffer(Request, sizeof(GMUX_READ_RESPONSE), (PVOID*)&resp, NULL);
         if (!NT_SUCCESS(status)) break;
 
-        resp->Success = GmuxRead8(context->MappedBase, req->Port, &value);
+        // METHOD_BUFFERED: request and response are the SAME system buffer (Value/Success
+        // overlay Port), so copy what the log needs before the response is written.
+        UCHAR port = req->Port;
+        BOOLEAN okRead = GmuxRead8(context->MappedBase, port, &value);
+        resp->Success = okRead;
         resp->Value = value;
         bytesReturned = sizeof(GMUX_READ_RESPONSE);
-        DbgPrint("[Gmux] READ8 port=0x%02X value=0x%02X success=%d\n",
-                 req->Port, value, resp->Success);
+        DbgPrint("[Gmux] READ8 port=0x%02X value=0x%02X success=%d\n", port, value, okRead);
         break;
     }
     case IOCTL_GMUX_WRITE8: {
@@ -633,10 +637,13 @@ EvtIoDeviceControl(
         status = WdfRequestRetrieveOutputBuffer(Request, sizeof(GMUX_WRITE_RESPONSE), (PVOID*)&resp, NULL);
         if (!NT_SUCCESS(status)) break;
 
-        resp->Success = GmuxWrite8(context->MappedBase, req->Port, req->Value);
+        // Same shared buffer as above: Success overlays Port.
+        UCHAR port = req->Port;
+        UCHAR val = req->Value;
+        BOOLEAN okWrite = GmuxWrite8(context->MappedBase, port, val);
+        resp->Success = okWrite;
         bytesReturned = sizeof(GMUX_WRITE_RESPONSE);
-        DbgPrint("[Gmux] WRITE8 port=0x%02X value=0x%02X success=%d\n",
-                 req->Port, req->Value, resp->Success);
+        DbgPrint("[Gmux] WRITE8 port=0x%02X value=0x%02X success=%d\n", port, val, okWrite);
         break;
     }
     case IOCTL_GMUX_SWITCH_TO: {
@@ -649,10 +656,12 @@ EvtIoDeviceControl(
         status = WdfRequestRetrieveOutputBuffer(Request, sizeof(GMUX_SWITCH_RESPONSE), (PVOID*)&resp, NULL);
         if (!NT_SUCCESS(status)) break;
 
-        resp->Success = GmuxSwitchTo(context->MappedBase, req->TargetIsDiscrete);
+        // Same shared buffer: Success overlays TargetIsDiscrete.
+        BOOLEAN toDiscrete = (BOOLEAN)(req->TargetIsDiscrete != 0);
+        BOOLEAN okSwitch = GmuxSwitchTo(context->MappedBase, toDiscrete);
+        resp->Success = okSwitch;
         bytesReturned = sizeof(GMUX_SWITCH_RESPONSE);
-        DbgPrint("[Gmux] SWITCH_TO target=%s success=%d\n",
-                 req->TargetIsDiscrete ? "dGPU" : "iGPU", resp->Success);
+        DbgPrint("[Gmux] SWITCH_TO target=%s success=%d\n", toDiscrete ? "dGPU" : "iGPU", okSwitch);
         break;
     }
     case IOCTL_GMUX_ROUTE: {

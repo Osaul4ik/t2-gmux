@@ -33,7 +33,8 @@
 
 // Route values as WRITTEN to ports 0x10 (panel) and 0x40 (external). They are also what this
 // project stores as the boot default. Readback is different: the panel route is read from
-// port 0x10 bit 0 (1 = dGPU, 0 = iGPU); port 0x11 gives 3 / 0 and 0x41 gives 0x00 / 0x10 on T2.
+// port 0x10 bit 0 (1 = dGPU, 0 = iGPU); port 0x11 gives 3 / 0 on T2. Port 0x41 is NOT a route
+// indicator (it read 0x10 with the panel on the dGPU after any write to 0x40).
 #define GMUX_ROUTE_IGD   2
 #define GMUX_ROUTE_DGPU  3
 
@@ -91,9 +92,9 @@ typedef struct _GMUX_DEFAULT_RESPONSE {
 #define GMUX_PORT_SWITCH_GET_DISPLAY 0x11  // informational only: 3 = dGPU, 0 = iGPU on T2 (Linux reads 0x10 bit 0)
 #define GMUX_PORT_INTERRUPT_ENABLE  0x14
 #define GMUX_PORT_INTERRUPT_STATUS  0x16
-#define GMUX_PORT_SWITCH_DDC       0x28   // panel DDC/AUX: 1 = iGPU, 2 = dGPU (written by Linux on every gmux type)
+#define GMUX_PORT_SWITCH_DDC       0x28   // panel DDC: 1 = iGPU, 2 = dGPU. Linux writes it; on this T2 gmux it reads 0 before and after
 #define GMUX_PORT_SWITCH_EXTERNAL  0x40   // external DP mux: 2 = iGPU, 3 = dGPU (separate from the panel mux)
-#define GMUX_PORT_SWITCH_GET_EXTERNAL 0x41  // informational only: 0x00 with dGPU, 0x10 with iGPU on T2
+#define GMUX_PORT_SWITCH_GET_EXTERNAL 0x41  // informational only: not a route indicator on T2 (0x00 at boot, 0x10 after writing 0x40)
 #define GMUX_PORT_DISCRETE_POWER  0x50   // dGPU power rail sequencing
 #define GMUX_PORT_MAX_BRIGHTNESS  0x70
 #define GMUX_PORT_BRIGHTNESS      0x74
