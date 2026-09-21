@@ -25,9 +25,9 @@ Drivers_Dir    = 13
 GmuxDriver.sys = 1,,
 
 [Manufacturer]
-%ManufacturerName% = Standard,NT$ARCH$
+%ManufacturerName% = Standard,NT$ARCH$.10.0...16299
 
-[Standard.NT$ARCH$]
+[Standard.NT$ARCH$.10.0...16299]
 %DeviceDesc% = GmuxDriver_Device, root\GmuxDriver
 
 [Drivers_Dir]
