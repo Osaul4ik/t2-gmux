@@ -253,7 +253,7 @@ EvtDeviceAdd(_In_ WDFDRIVER Driver, _Inout_ PWDFDEVICE_INIT DeviceInit)
     if (!NT_SUCCESS(status)) return status;
 
     WdfDeviceInitSetDeviceType(DeviceInit, FILE_DEVICE_UNKNOWN);
-    WdfDeviceInitSetCharacteristics(DeviceInit, FILE_DEVICE_SECURE_IO, FALSE);
+    WdfDeviceInitSetCharacteristics(DeviceInit, FILE_DEVICE_SECURE_OPEN, FALSE);
 
     WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&attributes, DEVICE_CONTEXT);
     attributes.EvtCleanupCallback = EvtDeviceContextCleanup;
@@ -361,6 +361,34 @@ EvtIoDeviceControl(
         bytesReturned = sizeof(GMUX_SWITCH_RESPONSE);
         DbgPrint("[Gmux] SWITCH_TO target=%s success=%d\n",
                  req->TargetIsDiscrete ? "dGPU" : "iGPU", resp->Success);
+        break;
+    }
+    case IOCTL_GMUX_ROUTE: {
+        PGMUX_SWITCH_REQUEST req = NULL;
+        PGMUX_SWITCH_RESPONSE resp = NULL;
+
+        status = WdfRequestRetrieveInputBuffer(Request, sizeof(GMUX_SWITCH_REQUEST), (PVOID*)&req, NULL);
+        if (!NT_SUCCESS(status)) break;
+
+        status = WdfRequestRetrieveOutputBuffer(Request, sizeof(GMUX_SWITCH_RESPONSE), (PVOID*)&resp, NULL);
+        if (!NT_SUCCESS(status)) break;
+
+        resp->Success = GmuxSwitchDisplayRoute(context->MappedBase, req->TargetIsDiscrete);
+        bytesReturned = sizeof(GMUX_SWITCH_RESPONSE);
+        break;
+    }
+    case IOCTL_GMUX_POWER: {
+        PGMUX_POWER_REQUEST req = NULL;
+        PGMUX_POWER_RESPONSE resp = NULL;
+
+        status = WdfRequestRetrieveInputBuffer(Request, sizeof(GMUX_POWER_REQUEST), (PVOID*)&req, NULL);
+        if (!NT_SUCCESS(status)) break;
+
+        status = WdfRequestRetrieveOutputBuffer(Request, sizeof(GMUX_POWER_RESPONSE), (PVOID*)&resp, NULL);
+        if (!NT_SUCCESS(status)) break;
+
+        resp->Success = GmuxSetDiscretePower(context->MappedBase, req->PowerOn, 250);
+        bytesReturned = sizeof(GMUX_POWER_RESPONSE);
         break;
     }
     default:
