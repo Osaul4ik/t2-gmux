@@ -15,9 +15,13 @@
 //     interrupt-based completion wait Linux uses is approximated with a
 //     fixed delay; Linux itself skips the wait when no GPE is found, so
 //     this is not worse than that fallback path).
-//   - GmuxSwitchDisplayRoute(): mirrors gmux_switchto() - panel route only.
+//   - GmuxSwitchDisplayRoute(): panel mux only (port 0x10).
+//   - GmuxSwitchExternalRoute(): external DP mux only (port 0x40). The gmux has TWO
+//     independent muxes; Linux gmux_switchto() writes both, and so does
+//     GmuxSwitchAllRoutes(). Before this, the external mux was never written, so an
+//     external monitor stayed wherever the firmware / an earlier power cycle left it.
 //   - GmuxSwitchTo(): the full sequenced operation - power target up first,
-//     route the panel, power the now-unused GPU down last. Never call
+//     route panel + external, power the now-unused GPU down last. Never call
 //     GmuxSwitchDisplayRoute() alone; that is what caused the black screen.
 //   - Boot default (replaces the old ForceIGD switch): `gmux -default` snapshots the
 //     current panel route into Parameters\DefaultRoute, and every time the device starts
@@ -63,6 +67,8 @@ _Success_(return) static BOOLEAN GmuxRead8(_In_ PUCHAR Base, _In_ UCHAR Port, _O
 static BOOLEAN GmuxWrite8(_In_ PUCHAR Base, _In_ UCHAR Port, _In_ UCHAR Value);
 static BOOLEAN GmuxSetDiscretePower(_In_ PUCHAR Base, _In_ BOOLEAN PowerOn, _In_ ULONG SettleMs);
 static BOOLEAN GmuxSwitchDisplayRoute(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete);
+static BOOLEAN GmuxSwitchExternalRoute(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete);
+static BOOLEAN GmuxSwitchAllRoutes(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete);
 static BOOLEAN GmuxSwitchTo(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete);
 _Success_(return) static BOOLEAN GmuxReadVersion(_In_ PUCHAR Base, _Out_ PUCHAR Major, _Out_ PUCHAR Minor, _Out_ PUCHAR Release);
 static BOOLEAN GmuxDetect(_In_ PUCHAR Base);
@@ -136,6 +142,29 @@ GmuxSwitchDisplayRoute(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete)
     return ok;
 }
 
+// ---- External DP mux only (port 0x40; readback on 0x41) ----
+static BOOLEAN
+GmuxSwitchExternalRoute(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete)
+{
+    BOOLEAN ok = GmuxWrite8(Base, GMUX_PORT_SWITCH_EXTERNAL, ToDiscrete ? 3 : 2);
+    DbgPrint("[Gmux] External route -> %s: %d\n", ToDiscrete ? "dGPU" : "iGPU", ok);
+    return ok;
+}
+
+// ---- Panel + external, in the same order as Linux gmux_switchto() ----
+// The result is the PANEL write. A failed external write is logged but not fatal: it must
+// not stop the caller from powering the right GPU, and models without an external mux
+// may simply not acknowledge it.
+static BOOLEAN
+GmuxSwitchAllRoutes(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete)
+{
+    BOOLEAN ok = GmuxSwitchDisplayRoute(Base, ToDiscrete);
+    if (!GmuxSwitchExternalRoute(Base, ToDiscrete)) {
+        DbgPrint("[Gmux] WARNING: external route write did not complete (panel result: %d)\n", ok);
+    }
+    return ok;
+}
+
 // ---- Full sequenced switch: power target up, route, power old one down ----
 static BOOLEAN
 GmuxSwitchTo(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete)
@@ -147,7 +176,7 @@ GmuxSwitchTo(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete)
         }
     }
 
-    BOOLEAN ok = GmuxSwitchDisplayRoute(Base, ToDiscrete);
+    BOOLEAN ok = GmuxSwitchAllRoutes(Base, ToDiscrete);
 
     if (!ToDiscrete) {
         // Only power the dGPU down if the panel actually moved to the iGPU.
@@ -256,34 +285,44 @@ WriteDefaultRoute(_In_ WDFDRIVER Driver, _In_ UCHAR Route)
 
 // Applied from EvtDevicePrepareHardware, i.e. before/while display drivers start - the same
 // "route first, modeset afterwards" order Linux gets from apple-gmux probing before i915.
+//
+// The panel mux and the external DP mux are independent, so each is compared with the target
+// on its own. The disruptive part (rail toggle / panel route write while the boot logo's
+// framebuffer is live, before the real GPU driver could retrain the link) only happens when
+// the PANEL is not already on the target. If the panel is fine and only the external mux is
+// off-target, just the external mux is written - that cannot affect the internal panel.
 static VOID
 ApplyDefaultRoute(_In_ PUCHAR Base, _In_ UCHAR Route)
 {
-    UCHAR current = 0;
-    BOOLEAN haveCurrent = GmuxRead8(Base, GMUX_PORT_SWITCH_GET_DISPLAY, &current);
+    UCHAR curPanel = 0;
+    UCHAR curExt = 0;
+    BOOLEAN havePanel = GmuxRead8(Base, GMUX_PORT_SWITCH_GET_DISPLAY, &curPanel);
+    BOOLEAN haveExt = GmuxRead8(Base, GMUX_PORT_SWITCH_GET_EXTERNAL, &curExt);
+    BOOLEAN toDiscrete = (BOOLEAN)(Route == GMUX_ROUTE_DGPU);
 
-    DbgPrint("[Gmux] Boot default = %s, current route = %s\n",
-             Route == GMUX_ROUTE_DGPU ? "dGPU" : "iGPU",
-             haveCurrent ? (current == GMUX_ROUTE_DGPU ? "dGPU" :
-                            current == GMUX_ROUTE_IGD  ? "iGPU" : "?") : "<read failed>");
+    DbgPrint("[Gmux] Boot default = %s, panel route = %s, external route = %s\n",
+             toDiscrete ? "dGPU" : "iGPU",
+             havePanel ? (curPanel == GMUX_ROUTE_DGPU ? "dGPU" :
+                          curPanel == GMUX_ROUTE_IGD  ? "iGPU" : "?") : "<read failed>",
+             haveExt ? (curExt == GMUX_ROUTE_DGPU ? "dGPU" :
+                        curExt == GMUX_ROUTE_IGD  ? "iGPU" : "?") : "<read failed>");
 
-    if (Route == GMUX_ROUTE_DGPU) {
-        // Only power-cycle + re-route when the panel is not already on the dGPU. The rail
-        // state itself still can't be read back (Linux never reads port 0x50), so if the
-        // route says something other than dGPU we still go through GmuxSwitchTo(TRUE) to be
-        // safe (rail may have been left off by a previous session). But if the route already
-        // reads dGPU, the panel link is presumably already up and live - forcing another
-        // power-rail toggle + route write here (right as the boot logo's framebuffer is live,
-        // before the real GPU driver has loaded to retrain the link) is what causes the
-        // black-screen-after-logo symptom. Skip it in that case.
-        if (!haveCurrent || current != GMUX_ROUTE_DGPU) {
-            GmuxSwitchTo(Base, TRUE);
+    if (havePanel && curPanel == Route) {
+        // Panel already on target: leave it (and the power rail) alone.
+        if (!haveExt || curExt != Route) {
+            GmuxSwitchExternalRoute(Base, toDiscrete);
         }
-    } else if (Route == GMUX_ROUTE_IGD) {
-        // Route only - never cut the rail at boot.
-        if (!haveCurrent || current != GMUX_ROUTE_IGD) {
-            GmuxSwitchDisplayRoute(Base, FALSE);
-        }
+        return;
+    }
+
+    if (toDiscrete) {
+        // Rail state can't be read back (Linux never reads port 0x50), so if the panel is not
+        // on the dGPU go through the full sequence (rail may have been left off by an earlier
+        // session). GmuxSwitchTo also writes the external mux.
+        GmuxSwitchTo(Base, TRUE);
+    } else {
+        // iGPU: routes only - never cut the rail at boot.
+        GmuxSwitchAllRoutes(Base, FALSE);
     }
 }
 
@@ -559,7 +598,21 @@ EvtIoDeviceControl(
         status = WdfRequestRetrieveOutputBuffer(Request, sizeof(GMUX_SWITCH_RESPONSE), (PVOID*)&resp, NULL);
         if (!NT_SUCCESS(status)) break;
 
-        resp->Success = GmuxSwitchDisplayRoute(context->MappedBase, req->TargetIsDiscrete);
+        resp->Success = GmuxSwitchAllRoutes(context->MappedBase, req->TargetIsDiscrete);
+        bytesReturned = sizeof(GMUX_SWITCH_RESPONSE);
+        break;
+    }
+    case IOCTL_GMUX_ROUTE_EXTERNAL: {
+        PGMUX_SWITCH_REQUEST req = NULL;
+        PGMUX_SWITCH_RESPONSE resp = NULL;
+
+        status = WdfRequestRetrieveInputBuffer(Request, sizeof(GMUX_SWITCH_REQUEST), (PVOID*)&req, NULL);
+        if (!NT_SUCCESS(status)) break;
+
+        status = WdfRequestRetrieveOutputBuffer(Request, sizeof(GMUX_SWITCH_RESPONSE), (PVOID*)&resp, NULL);
+        if (!NT_SUCCESS(status)) break;
+
+        resp->Success = GmuxSwitchExternalRoute(context->MappedBase, req->TargetIsDiscrete);
         bytesReturned = sizeof(GMUX_SWITCH_RESPONSE);
         break;
     }

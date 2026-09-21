@@ -15,7 +15,9 @@
 //                          is pressed within [sec] (default 20) the panel is routed back to the
 //                          dGPU automatically - no reboot needed if the screen stays black.
 //   gmux status            gmux version, raw route/power ports, Intel + Radeon PnP state
-//   gmux route i|d         panel route only
+//   gmux route i|d         panel route + external DP mux (both, like Linux gmux_switchto)
+//   gmux ext i|d           external DP mux only (port 0x40) - use when the panel is fine but
+//                          an external monitor stays black
 //   gmux power on|off      dGPU power rail only (WARNING: off while the Radeon driver is
 //                          running can TDR/BSOD - use `amd disable` first)
 //   gmux amd disable|enable   PnP disable/enable of the Radeon display adapter
@@ -72,12 +74,28 @@ static bool Read8(HANDLE h, UCHAR port, UCHAR* value)
     return true;
 }
 
+// Panel mux + external DP mux (the driver writes both, panel first).
 static bool Route(HANDLE h, bool toDiscrete)
 {
     GMUX_SWITCH_REQUEST req = { (UCHAR)(toDiscrete ? 1 : 0) };
     GMUX_SWITCH_RESPONSE resp = { 0 };
-    printf("  route panel -> %s ...\n", toDiscrete ? "dGPU (Radeon)" : "iGPU (Intel)");
+    printf("  route panel + external -> %s ...\n", toDiscrete ? "dGPU (Radeon)" : "iGPU (Intel)");
     return Ioctl(h, IOCTL_GMUX_ROUTE, &req, sizeof(req), &resp, sizeof(resp)) && resp.Success;
+}
+
+// External DP mux only. Needs a driver that knows IOCTL_GMUX_ROUTE_EXTERNAL.
+static bool RouteExternal(HANDLE h, bool toDiscrete)
+{
+    GMUX_SWITCH_REQUEST req = { (UCHAR)(toDiscrete ? 1 : 0) };
+    GMUX_SWITCH_RESPONSE resp = { 0 };
+    printf("  route external DP -> %s ...\n", toDiscrete ? "dGPU (Radeon)" : "iGPU (Intel)");
+    if (!Ioctl(h, IOCTL_GMUX_ROUTE_EXTERNAL, &req, sizeof(req), &resp, sizeof(resp))) {
+        if (GetLastError() == ERROR_INVALID_FUNCTION) {
+            printf("  the installed GmuxDriver.sys is too old for this command - install the new build.\n");
+        }
+        return false;
+    }
+    return resp.Success != 0;
 }
 
 static bool Power(HANDLE h, bool on)
@@ -260,6 +278,8 @@ static void CmdStatus(HANDLE h)
     PrintPort(h, GMUX_PORT_VERSION_MAJOR,      "version major");
     PrintPort(h, GMUX_PORT_SWITCH_DISPLAY,     "switch display (0x10)");
     PrintPort(h, GMUX_PORT_SWITCH_GET_DISPLAY, "get display (0x11)");
+    PrintPort(h, GMUX_PORT_SWITCH_EXTERNAL,    "switch external (0x40)");
+    PrintPort(h, GMUX_PORT_SWITCH_GET_EXTERNAL,"get external (0x41)");
     PrintPort(h, GMUX_PORT_DISCRETE_POWER,     "discrete power (0x50)");
     printf("  (raw values - Linux never reads 0x50 back, so compare before/after a command)\n");
     {
@@ -319,11 +339,18 @@ static int CmdToRadeon(HANDLE h)
     // Idempotency check: if the panel is already routed to a live Radeon, running the full
     // sequence again (power rail bounce + PCI rescan + route write) has no benefit and can
     // itself drop the panel link with nothing left to retrain it. Bail out early instead.
-    UCHAR curRoute = 0;
+    // The external DP mux is independent of the panel mux, so it is checked separately: if only
+    // that one is off-target, fix just it (cannot disturb the internal panel).
+    UCHAR curRoute = 0, curExt = 0;
     GpuInfo amdNow;
     if (Read8(h, GMUX_PORT_SWITCH_GET_DISPLAY, &curRoute) && curRoute == GMUX_ROUTE_DGPU &&
         QueryGpu(VEN_AMD, &amdNow) && GpuRunning(amdNow)) {
-        printf("  already routed to Radeon and it is running - nothing to do.\n");
+        if (!Read8(h, GMUX_PORT_SWITCH_GET_EXTERNAL, &curExt) || curExt != GMUX_ROUTE_DGPU) {
+            printf("  panel already on Radeon, external DP mux is not - routing external only.\n");
+            if (!RouteExternal(h, true)) { printf("FAILED: external route write failed.\n"); return 1; }
+        } else {
+            printf("  already routed to Radeon (panel + external) and it is running - nothing to do.\n");
+        }
         CmdStatus(h);
         return 0;
     }
@@ -436,7 +463,7 @@ static int CmdDefault(HANDLE h, const char* arg)
 
     if (!DefaultIoctl(h, IOCTL_GMUX_SET_DEFAULT, &d)) { printf("FAILED to store the boot default.\n"); return 1; }
     printf("Boot default stored: %s. Applied by the driver on every boot.\n", RouteName(d.Route));
-    printf("(Scope: panel route only. Port 0x50 cannot be read back, and brightness is owned by Windows.)\n");
+    printf("(The driver applies the default to the panel mux and the external DP mux. Port 0x50 cannot be read back, and brightness is owned by Windows.)\n");
     return 0;
 }
 
@@ -448,7 +475,8 @@ static void Usage()
            "                             (i and d below last only until the next reboot)\n"
            "  gmux status                ports + Intel/Radeon PnP state\n"
            "  gmux trial [sec]           reversible iGPU test, auto-reverts to dGPU (default 20 s)\n"
-           "  gmux route i|d             panel route only\n"
+           "  gmux route i|d             panel route + external DP mux\n"
+           "  gmux ext i|d               external DP mux only\n"
            "  gmux power on|off          dGPU power rail only\n"
            "  gmux amd disable|enable    PnP disable/enable of the Radeon\n"
            "  gmux read <hexport>        raw port read, e.g. gmux read 50\n");
@@ -492,6 +520,10 @@ int main(int argc, char** argv)
     }
     else if (!_stricmp(cmd, "route") && (*a2 == 'i' || *a2 == 'I' || *a2 == 'd' || *a2 == 'D')) {
         rc = Route(h, *a2 == 'd' || *a2 == 'D') ? 0 : 1;
+        CmdStatus(h);
+    }
+    else if (!_stricmp(cmd, "ext") && (*a2 == 'i' || *a2 == 'I' || *a2 == 'd' || *a2 == 'D')) {
+        rc = RouteExternal(h, *a2 == 'd' || *a2 == 'D') ? 0 : 1;
         CmdStatus(h);
     }
     else if (!_stricmp(cmd, "power") && (!_stricmp(a2, "on") || !_stricmp(a2, "off"))) {

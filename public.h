@@ -8,8 +8,12 @@
 #define IOCTL_GMUX_WRITE8    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_GMUX_SWITCH_TO CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
 // Granular building blocks so the client can insert PnP steps between them:
-//   ROUTE - panel route only (GMUX_SWITCH_REQUEST/RESPONSE, TargetIsDiscrete)
-//   POWER - dGPU power rail only (GMUX_POWER_REQUEST/RESPONSE)
+//   ROUTE          - panel route (port 0x10) AND external DP mux (port 0x40), written in
+//                    that order like Linux gmux_switchto() (GMUX_SWITCH_REQUEST/RESPONSE,
+//                    TargetIsDiscrete). Success reflects the panel write; a failed external
+//                    write is only logged (models without an external mux).
+//   POWER          - dGPU power rail only (GMUX_POWER_REQUEST/RESPONSE)
+//   ROUTE_EXTERNAL - external DP mux only (port 0x40), same request/response as ROUTE
 #define IOCTL_GMUX_ROUTE     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_GMUX_POWER     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
 // Boot default. The driver keeps the panel route in
@@ -21,8 +25,10 @@
 #define IOCTL_GMUX_SET_DEFAULT   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_GMUX_GET_DEFAULT   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x806, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_GMUX_CLEAR_DEFAULT CTL_CODE(FILE_DEVICE_UNKNOWN, 0x807, METHOD_BUFFERED, FILE_ANY_ACCESS)
+// External DP mux only (for testing one thing at a time; ROUTE already covers both muxes).
+#define IOCTL_GMUX_ROUTE_EXTERNAL CTL_CODE(FILE_DEVICE_UNKNOWN, 0x808, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
-// Route values are the same numbers gmux uses on ports 0x10 / 0x11.
+// Route values are the same numbers gmux uses on ports 0x10 / 0x11 (panel) and 0x40 / 0x41 (external).
 #define GMUX_ROUTE_IGD   2
 #define GMUX_ROUTE_DGPU  3
 
@@ -77,8 +83,8 @@ typedef struct _GMUX_DEFAULT_RESPONSE {
 #define GMUX_PORT_INTERRUPT_ENABLE  0x14
 #define GMUX_PORT_INTERRUPT_STATUS  0x16
 #define GMUX_PORT_SWITCH_DDC       0x28   // classic PIO gmux only, unused on T2
-#define GMUX_PORT_SWITCH_EXTERNAL  0x40   // external DP mux
-#define GMUX_PORT_SWITCH_GET_EXTERNAL 0x41
+#define GMUX_PORT_SWITCH_EXTERNAL  0x40   // external DP mux: 2 = iGPU, 3 = dGPU (separate from the panel mux)
+#define GMUX_PORT_SWITCH_GET_EXTERNAL 0x41  // external DP mux readback
 #define GMUX_PORT_DISCRETE_POWER  0x50   // dGPU power rail sequencing
 #define GMUX_PORT_MAX_BRIGHTNESS  0x70
 #define GMUX_PORT_BRIGHTNESS      0x74
