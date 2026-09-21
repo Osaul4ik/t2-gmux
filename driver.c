@@ -19,8 +19,8 @@
 //   - GmuxSwitchTo(): the full sequenced operation - power target up first,
 //     route the panel, power the now-unused GPU down last. Never call
 //     GmuxSwitchDisplayRoute() alone; that is what caused the black screen.
-//   - ForceIGD-on-load, read from the driver's Parameters registry key,
-//     mirroring Linux's apple_gmux.force_igd=1 module option.
+//   - ForceIGD-on-load (opt-in via the Parameters key, default 0), modelled on the
+//     out-of-tree t2linux apple_gmux.force_igd patch (not in mainline Linux).
 
 #include <ntddk.h>
 #include <wdf.h>
@@ -61,6 +61,7 @@ static BOOLEAN GmuxWrite8(_In_ PUCHAR Base, _In_ UCHAR Port, _In_ UCHAR Value);
 static BOOLEAN GmuxSetDiscretePower(_In_ PUCHAR Base, _In_ BOOLEAN PowerOn, _In_ ULONG SettleMs);
 static BOOLEAN GmuxSwitchDisplayRoute(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete);
 static BOOLEAN GmuxSwitchTo(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete);
+_Success_(return) static BOOLEAN GmuxReadVersion(_In_ PUCHAR Base, _Out_ PUCHAR Major, _Out_ PUCHAR Minor, _Out_ PUCHAR Release);
 static BOOLEAN GmuxDetect(_In_ PUCHAR Base);
 static ULONG   ReadForceIgdSetting(_In_ WDFDRIVER Driver);
 
@@ -153,23 +154,62 @@ GmuxSwitchTo(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete)
     return ok;
 }
 
-// ---- Version check (port 0x04) ----
+// ---- Version (port 0x04, 4-byte read) ----
+// Linux (T2/MMIO gmux) reads it with ioread32be(): major = v>>24, minor = v>>16,
+// release = v>>8, i.e. data bytes 0, 1, 2. Used for logging only.
+_Success_(return)
+static BOOLEAN
+GmuxReadVersion(_In_ PUCHAR Base, _Out_ PUCHAR Major, _Out_ PUCHAR Minor, _Out_ PUCHAR Release)
+{
+    *Major = 0;
+    *Minor = 0;
+    *Release = 0;
+
+    if (!PollCommandClear(Base, 200)) return FALSE;
+    WRITE_REGISTER_UCHAR(Base + OFF_PORT_SELECT, GMUX_PORT_VERSION_MAJOR);
+    WRITE_REGISTER_UCHAR(Base + OFF_COMMAND, 0x04); // read len=4
+    if (!PollCommandClear(Base, 200)) return FALSE;
+
+    *Major   = READ_REGISTER_UCHAR(Base + OFF_DATA + 0);
+    *Minor   = READ_REGISTER_UCHAR(Base + OFF_DATA + 1);
+    *Release = READ_REGISTER_UCHAR(Base + OFF_DATA + 2);
+    return TRUE;
+}
+
+// ---- Presence check, same as Linux apple_gmux_is_mmio() ----
+// The command register reads 0xFF when no gmux is behind the mapping (a live gmux
+// resets it to 0x00, or shows 0x01/0x04/0x41/0x44 while a command is in flight).
+// The version value is NOT used to accept/reject: Linux only prints it. The old
+// "major == 1 or 2" gate is not in Linux and made PrepareHardware fail (Code 10).
 static BOOLEAN
 GmuxDetect(_In_ PUCHAR Base)
 {
-    UCHAR ver;
-    if (!GmuxRead8(Base, GMUX_PORT_VERSION_MAJOR, &ver)) return FALSE;
-    DbgPrint("[Gmux] Version major = %d (0x%02X)\n", ver, ver);
-    return (ver == 0x01 || ver == 0x02);
+    UCHAR cmd = READ_REGISTER_UCHAR(Base + OFF_COMMAND);
+    UCHAR major, minor, release;
+
+    DbgPrint("[Gmux] Detect: command register = 0x%02X\n", cmd);
+    if (cmd == 0xFF) {
+        return FALSE;
+    }
+
+    if (GmuxReadVersion(Base, &major, &minor, &release)) {
+        DbgPrint("[Gmux] Found gmux version %u.%u.%u\n", major, minor, release);
+    } else {
+        DbgPrint("[Gmux] Version read timed out (command register stuck) - continuing\n");
+    }
+    return TRUE;
 }
 
 // ---- Read ForceIGD DWORD from the driver's Parameters registry key ----
 // HKLM\SYSTEM\CurrentControlSet\Services\<ServiceName>\Parameters\ForceIGD
-// Default 1 (force iGPU), mirroring Linux's apple_gmux.force_igd=1.
+// Default 0 (off). The t2linux force_igd patch only routes the panel and first checks
+// that the Intel iGPU is present; this driver's GmuxSwitchTo(FALSE) also cuts the
+// dGPU power rail, which is unsafe while the Radeon driver is running. Use the
+// gmux.exe client (`gmux i`) for a sequenced switch; set ForceIGD=1 only to opt in.
 static ULONG
 ReadForceIgdSetting(_In_ WDFDRIVER Driver)
 {
-    ULONG value = 1;
+    ULONG value = 0;
     WDFKEY key;
 
     if (NT_SUCCESS(WdfDriverOpenParametersRegistryKey(Driver, KEY_READ,
@@ -282,9 +322,9 @@ EvtDevicePrepareHardware(
     context->Mapped = TRUE;
     DbgPrint("[Gmux] MMIO mapped, version check passed\n");
 
-    // ForceIGD-on-load, mirroring Linux apple_gmux.force_igd=1. Uses the full
-    // sequenced GmuxSwitchTo(), never a raw display-route-only write. Applied
-    // once per device object, not again on a PnP stop/start rebalance.
+    // Opt-in ForceIGD-on-load (Parameters\ForceIGD=1, default off), modelled on the
+    // t2linux force_igd patch. Uses the full sequenced GmuxSwitchTo(). Applied once
+    // per device object, not again on a PnP stop/start rebalance.
     if (!context->ForceIgdApplied) {
         context->ForceIgdApplied = TRUE;
         if (ReadForceIgdSetting(WdfGetDriver())) {
