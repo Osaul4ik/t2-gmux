@@ -29,6 +29,9 @@ GmuxDriver.sys = 1,,
 
 [Standard.NT$ARCH$.10.0...16299]
 %DeviceDesc% = GmuxDriver_Device, root\GmuxDriver
+; The real ACPI node (gets the MMIO resource from ACPI instead of the fallback address).
+; Only ONE instance can exist (fixed \Device\GmuxCtl): remove the root\GmuxDriver node first.
+%DeviceDescAcpi% = GmuxDriver_Device, ACPI\APP000B
 
 [Drivers_Dir]
 GmuxDriver.sys
@@ -58,4 +61,5 @@ SPSVCINST_ASSOCSERVICE = 0x00000002
 ManufacturerName       = "Osaul4ik"
 DiskName               = "Gmux Driver Installation Disk"
 DeviceDesc             = "Apple GMUX Control Device"
+DeviceDescAcpi         = "Apple GMUX Control Device (ACPI)"
 ServiceDesc            = "GMUX Control Service"

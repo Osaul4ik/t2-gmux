@@ -29,6 +29,11 @@
 //   gmux read <hexport>    raw 8-bit read of a gmux port, e.g. `gmux read 50`
 //   gmux write <hexport> <hexval>   raw 8-bit write, e.g. `gmux write 16 1D`. Port 0x50 is refused
 //                          here, use `gmux power`.
+//   gmux bl                show panel backlight (gmux port 0x74 / max 0x70)
+//   gmux bl <0-100>        set backlight in percent (min raw value is 1, never 0)
+//   gmux bl +N | -N        relative change in percent points, e.g. `gmux bl -10`
+//   gmux bl raw <value>    set the raw gmux value (decimal or 0x...)
+//   gmux bl watch          print changes of gmux port 0x74 while you move the Windows slider
 //   gmux efi               READ-ONLY: firmware boot GPU preference (gpu-power-prefs), no driver needed
 
 #include <windows.h>
@@ -141,6 +146,92 @@ static bool DefaultIoctl(HANDLE h, DWORD code, GMUX_DEFAULT_RESPONSE* resp)
 static const char* RouteName(UCHAR r)
 {
     return r == GMUX_ROUTE_DGPU ? "dGPU (Radeon)" : r == GMUX_ROUTE_IGD ? "iGPU (Intel)" : "(none)";
+}
+
+// Panel backlight: gmux ports 0x74 (current) / 0x70 (max), 32-bit big-endian, handled by the driver.
+static bool GetBacklight(HANDLE h, ULONG* value, ULONG* max)
+{
+    GMUX_BL_GET_RESPONSE resp;
+    ZeroMemory(&resp, sizeof(resp));
+    if (!Ioctl(h, IOCTL_GMUX_BL_GET, NULL, 0, &resp, sizeof(resp))) {
+        if (GetLastError() == ERROR_INVALID_FUNCTION) {
+            printf("  the installed GmuxDriver.sys is too old for this command - install the new build.\n");
+        }
+        return false;
+    }
+    if (!resp.Success) return false;
+    *value = resp.Value;
+    *max = resp.Max;
+    return true;
+}
+
+static bool SetBacklight(HANDLE h, ULONG value)
+{
+    GMUX_BL_SET_REQUEST req = { value };
+    GMUX_BL_SET_RESPONSE resp = { 0 };
+    return Ioctl(h, IOCTL_GMUX_BL_SET, &req, sizeof(req), &resp, sizeof(resp)) && resp.Success;
+}
+
+static void PrintBacklight(HANDLE h)
+{
+    ULONG v = 0, m = 0;
+    if (!GetBacklight(h, &v, &m)) { printf("  backlight: <read failed>\n"); return; }
+    if (m) printf("  backlight = %lu / %lu (%lu%%)   [port 0x74 / 0x70]\n", v, m, (ULONG)(((unsigned long long)v * 100 + m / 2) / m));
+    else   printf("  backlight = %lu   [port 0x74; max (0x70) unreadable]\n", v);
+}
+
+// Probe: print every change of gmux backlight port 0x74 until a key is pressed. Run it while moving
+// the Windows brightness slider (Radeon boot). A change means the stock AMD driver reaches the gmux
+// (through ACPI); no change means the panel is dimmed some other way (GPU PWM / DPCD AUX).
+static int CmdBacklightWatch(HANDLE h)
+{
+    ULONG cur = 0, max = 0, last = 0;
+    if (!GetBacklight(h, &last, &max)) { printf("ABORT: cannot read the backlight.\n"); return 1; }
+    printf("  watching port 0x74 (max 0x70 = %lu), start = %lu. Move the brightness slider; any key stops.\n", max, last);
+    ULONG changes = 0;
+    while (!_kbhit()) {
+        if (GetBacklight(h, &cur, &max) && cur != last) {
+            printf("  [%8lu ms] 0x74: %lu -> %lu\n", GetTickCount(), last, cur);
+            last = cur;
+            ++changes;
+        }
+        Sleep(100);
+    }
+    _getch();
+    printf("  %lu change(s) seen.\n", changes);
+    return 0;
+}
+
+// a2/a3 are the RAW argv strings (Arg() would strip the sign of "-10").
+static int CmdBacklight(HANDLE h, const char* a2, const char* a3)
+{
+    ULONG cur = 0, max = 0;
+    if (!GetBacklight(h, &cur, &max)) { printf("ABORT: cannot read the backlight.\n"); return 1; }
+    if (!*a2) { PrintBacklight(h); return 0; }
+    if (!_stricmp(a2, "watch")) return CmdBacklightWatch(h);
+
+    ULONG target;
+    if (!_stricmp(a2, "raw")) {
+        if (!*a3) { printf("usage: gmux bl raw <value>\n"); return 1; }
+        target = (ULONG)strtoul(a3, NULL, 0);
+    } else {
+        if (!max) { printf("ABORT: max brightness (port 0x70) unreadable - use `gmux bl raw <value>`.\n"); return 1; }
+        long long pct;
+        if (*a2 == '+' || *a2 == '-') {
+            pct = (long long)((unsigned long long)cur * 100 / max) + strtol(a2, NULL, 10);
+        } else {
+            pct = strtol(a2, NULL, 10);
+        }
+        if (pct < 0) pct = 0;
+        if (pct > 100) pct = 100;
+        target = (ULONG)((unsigned long long)max * (unsigned long long)pct / 100);
+        if (target == 0) target = 1;   // 0 may switch the panel completely off
+    }
+
+    printf("  backlight %lu -> %lu ...\n", cur, target);
+    if (!SetBacklight(h, target)) { printf("FAILED: backlight write.\n"); return 1; }
+    PrintBacklight(h);
+    return 0;
 }
 
 // ------------------------------------------------------------------- PnP side
@@ -343,6 +434,7 @@ static void CmdStatus(HANDLE h)
             printf("  boot default route              = %s\n", RouteName(d.Route));
         }
     }
+    PrintBacklight(h);
     printf("adapters:\n");
     PrintGpu(L"Intel", VEN_INTEL);
     PrintGpu(L"Radeon", VEN_AMD);
@@ -583,6 +675,7 @@ static void Usage()
            "  gmux amd disable|enable    PnP disable/enable of the Radeon (disable is not persistent)\n"
            "  gmux read <hexport>        raw port read, e.g. gmux read 50\n"
            "  gmux write <hexport> <hexval>   raw port write, e.g. gmux write 16 1D\n"
+           "  gmux bl [<0-100>|+N|-N|raw <v>]   panel backlight via gmux (no arg = show)\n"
            "  gmux efi                   READ-ONLY: show the firmware's boot GPU preference\n"
            "                             (gpu-power-prefs EFI variable); no driver needed\n");
 }
@@ -652,6 +745,9 @@ int main(int argc, char** argv)
         rc = (SetGpuState(VEN_AMD, disable ? DICS_DISABLE : DICS_ENABLE) && WaitGpu(VEN_AMD, disable, 15000)) ? 0 : 1;
         printf(rc == 0 ? "  OK\n" : "  FAILED / not confirmed\n");
         CmdStatus(h);
+    }
+    else if (!_stricmp(cmd, "bl") || !_stricmp(cmd, "backlight")) {
+        rc = CmdBacklight(h, argc > 2 ? argv[2] : "", argc > 3 ? argv[3] : "");
     }
     else if (!_stricmp(cmd, "read") && *a2) {
         UCHAR port = (UCHAR)strtoul(a2, NULL, 16);
