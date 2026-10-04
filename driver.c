@@ -43,6 +43,26 @@
 #include <wdf.h>
 #include "public.h"
 
+// ---- SAFETY SWITCH ----
+// 0 (default): the driver NEVER writes the panel route (0x10), DDC (0x28), external mux (0x40)
+// or the dGPU power rail (0x50), from IOCTLs, from the raw WRITE8 IOCTL, or from the boot default.
+// Reads and the backlight (0x70/0x74) still work. Nothing can black the panel.
+// Build with /DGMUX_ALLOW_SWITCH=1 to get the old behaviour back.
+#ifndef GMUX_ALLOW_SWITCH
+#define GMUX_ALLOW_SWITCH 0
+#endif
+
+// Plain (non-const) variable on purpose: no constant folding, so no unreachable-code warnings
+// (the WDK build uses /W4 /WX).
+static BOOLEAN g_AllowSwitch = GMUX_ALLOW_SWITCH;
+
+static BOOLEAN
+GmuxPortSwitches(_In_ UCHAR Port)
+{
+    return (BOOLEAN)(Port == GMUX_PORT_SWITCH_DISPLAY || Port == GMUX_PORT_SWITCH_DDC ||
+                     Port == GMUX_PORT_SWITCH_EXTERNAL || Port == GMUX_PORT_DISCRETE_POWER);
+}
+
 // ---- Hardware base ----
 // Only used for a root-enumerated node that has no ACPI resource. Normal path:
 // the address comes from EvtDevicePrepareHardware.
@@ -79,6 +99,10 @@ EVT_WDF_IO_QUEUE_IO_DEVICE_CONTROL EvtIoDeviceControl;
 static BOOLEAN PollCommandClear(_In_ PUCHAR Base, _In_ ULONG TimeoutMs);
 _Success_(return) static BOOLEAN GmuxRead8(_In_ PUCHAR Base, _In_ UCHAR Port, _Out_ PUCHAR Value);
 static BOOLEAN GmuxWrite8(_In_ PUCHAR Base, _In_ UCHAR Port, _In_ UCHAR Value);
+_Success_(return) static BOOLEAN GmuxRead32(_In_ PUCHAR Base, _In_ UCHAR Port, _Out_ PULONG Value);
+static BOOLEAN GmuxWrite32(_In_ PUCHAR Base, _In_ UCHAR Port, _In_ ULONG Value);
+_Success_(return) static BOOLEAN GmuxGetBacklight(_In_ PUCHAR Base, _Out_ PULONG Value, _Out_ PULONG Max);
+static BOOLEAN GmuxSetBacklight(_In_ PUCHAR Base, _In_ ULONG Value);
 static BOOLEAN GmuxSetDiscretePower(_In_ PUCHAR Base, _In_ BOOLEAN PowerOn, _In_ ULONG SettleMs);
 static BOOLEAN GmuxSwitchDdc(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete);
 static BOOLEAN GmuxSwitchDisplayRoute(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete);
@@ -133,10 +157,79 @@ GmuxWrite8(_In_ PUCHAR Base, _In_ UCHAR Port, _In_ UCHAR Value)
     return PollCommandClear(Base, 200);
 }
 
+// ---- Read32 / Write32 (Linux gmux_mmio_read32 / gmux_mmio_write32) ----
+// The data window +0x00..+0x03 holds the value BIG-endian (ioread32be / cpu_to_be32).
+// Command = 4 (read, len 4) or 0x40|4 (write, len 4).
+_Success_(return)
+static BOOLEAN
+GmuxRead32(_In_ PUCHAR Base, _In_ UCHAR Port, _Out_ PULONG Value)
+{
+    *Value = 0;
+    if (!PollCommandClear(Base, 200)) return FALSE;
+    WRITE_REGISTER_UCHAR(Base + OFF_PORT_SELECT, Port);
+    WRITE_REGISTER_UCHAR(Base + OFF_COMMAND, 0x04);
+    if (!PollCommandClear(Base, 200)) return FALSE;
+
+    *Value = ((ULONG)READ_REGISTER_UCHAR(Base + OFF_DATA + 0) << 24) |
+             ((ULONG)READ_REGISTER_UCHAR(Base + OFF_DATA + 1) << 16) |
+             ((ULONG)READ_REGISTER_UCHAR(Base + OFF_DATA + 2) << 8)  |
+              (ULONG)READ_REGISTER_UCHAR(Base + OFF_DATA + 3);
+    return TRUE;
+}
+
+static BOOLEAN
+GmuxWrite32(_In_ PUCHAR Base, _In_ UCHAR Port, _In_ ULONG Value)
+{
+    if (!PollCommandClear(Base, 200)) return FALSE;
+    WRITE_REGISTER_UCHAR(Base + OFF_DATA + 0, (UCHAR)(Value >> 24));
+    WRITE_REGISTER_UCHAR(Base + OFF_DATA + 1, (UCHAR)(Value >> 16));
+    WRITE_REGISTER_UCHAR(Base + OFF_DATA + 2, (UCHAR)(Value >> 8));
+    WRITE_REGISTER_UCHAR(Base + OFF_DATA + 3, (UCHAR)Value);
+    WRITE_REGISTER_UCHAR(Base + OFF_PORT_SELECT, Port);
+    WRITE_REGISTER_UCHAR(Base + OFF_COMMAND, 0x44);
+    return PollCommandClear(Base, 200);
+}
+
+// ---- Panel backlight (Linux gmux_get_brightness / gmux_update_status) ----
+// current = port 0x74 & 0xFFFFFF, max = port 0x70. Independent of which GPU drives the panel.
+_Success_(return)
+static BOOLEAN
+GmuxGetBacklight(_In_ PUCHAR Base, _Out_ PULONG Value, _Out_ PULONG Max)
+{
+    ULONG v = 0, m = 0;
+
+    *Value = 0;
+    *Max = 0;
+    if (!GmuxRead32(Base, GMUX_PORT_BRIGHTNESS, &v)) return FALSE;
+    if (!GmuxRead32(Base, GMUX_PORT_MAX_BRIGHTNESS, &m)) m = 0;
+    *Value = v & GMUX_BRIGHTNESS_MASK;
+    *Max = m & GMUX_BRIGHTNESS_MASK;
+    return TRUE;
+}
+
+static BOOLEAN
+GmuxSetBacklight(_In_ PUCHAR Base, _In_ ULONG Value)
+{
+    ULONG cur = 0, max = 0;
+    BOOLEAN ok;
+
+    Value &= GMUX_BRIGHTNESS_MASK;
+    if (GmuxGetBacklight(Base, &cur, &max) && max != 0 && Value > max) {
+        Value = max;
+    }
+    ok = GmuxWrite32(Base, GMUX_PORT_BRIGHTNESS, Value);
+    DbgPrint("[Gmux] Backlight -> 0x%lX (max 0x%lX): %d\n", Value, max, ok);
+    return ok;
+}
+
 // ---- dGPU power rail sequencing (mirrors gmux_set_discrete_state) ----
 static BOOLEAN
 GmuxSetDiscretePower(_In_ PUCHAR Base, _In_ BOOLEAN PowerOn, _In_ ULONG SettleMs)
 {
+    if (!g_AllowSwitch) {
+        DbgPrint("[Gmux] Discrete power change BLOCKED (GMUX_ALLOW_SWITCH=0)\n");
+        return FALSE;
+    }
     BOOLEAN ok = GmuxWrite8(Base, GMUX_PORT_DISCRETE_POWER, 1);
     ok = (BOOLEAN)(GmuxWrite8(Base, GMUX_PORT_DISCRETE_POWER, PowerOn ? 3 : 0) && ok);
 
@@ -167,6 +260,10 @@ GmuxSetDiscretePower(_In_ PUCHAR Base, _In_ BOOLEAN PowerOn, _In_ ULONG SettleMs
 static BOOLEAN
 GmuxSwitchDdc(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete)
 {
+    if (!g_AllowSwitch) {
+        DbgPrint("[Gmux] DDC route BLOCKED (GMUX_ALLOW_SWITCH=0)\n");
+        return FALSE;
+    }
     BOOLEAN ok = GmuxWrite8(Base, GMUX_PORT_SWITCH_DDC, ToDiscrete ? GMUX_DDC_DGPU : GMUX_DDC_IGD);
     DbgPrint("[Gmux] DDC route -> %s: %d\n", ToDiscrete ? "dGPU" : "iGPU", ok);
     return ok;
@@ -189,6 +286,10 @@ GmuxReadPanelRoute(_In_ PUCHAR Base, _Out_ PUCHAR Route)
 static BOOLEAN
 GmuxSwitchDisplayRoute(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete)
 {
+    if (!g_AllowSwitch) {
+        DbgPrint("[Gmux] Display route BLOCKED (GMUX_ALLOW_SWITCH=0)\n");
+        return FALSE;
+    }
     BOOLEAN ok = GmuxWrite8(Base, GMUX_PORT_SWITCH_DISPLAY, ToDiscrete ? 3 : 2);
     DbgPrint("[Gmux] Display route -> %s: %d\n", ToDiscrete ? "dGPU" : "iGPU", ok);
     return ok;
@@ -198,6 +299,10 @@ GmuxSwitchDisplayRoute(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete)
 static BOOLEAN
 GmuxSwitchExternalRoute(_In_ PUCHAR Base, _In_ BOOLEAN ToDiscrete)
 {
+    if (!g_AllowSwitch) {
+        DbgPrint("[Gmux] External route BLOCKED (GMUX_ALLOW_SWITCH=0)\n");
+        return FALSE;
+    }
     BOOLEAN ok = GmuxWrite8(Base, GMUX_PORT_SWITCH_EXTERNAL, ToDiscrete ? 3 : 2);
     DbgPrint("[Gmux] External route -> %s: %d\n", ToDiscrete ? "dGPU" : "iGPU", ok);
     return ok;
@@ -375,6 +480,10 @@ WriteDefaultRoute(_In_ WDFDRIVER Driver, _In_ UCHAR Route)
 static VOID
 ApplyDefaultRoute(_In_ PUCHAR Base, _In_ UCHAR Route)
 {
+    if (!g_AllowSwitch) {
+        DbgPrint("[Gmux] Boot default (%u) IGNORED (GMUX_ALLOW_SWITCH=0)\n", Route);
+        return;
+    }
     UCHAR curPanel = 0;
     BOOLEAN havePanel = GmuxReadPanelRoute(Base, &curPanel);
     BOOLEAN toDiscrete = (BOOLEAN)(Route == GMUX_ROUTE_DGPU);
@@ -640,6 +749,12 @@ EvtIoDeviceControl(
         // Same shared buffer as above: Success overlays Port.
         UCHAR port = req->Port;
         UCHAR val = req->Value;
+        if (!g_AllowSwitch && GmuxPortSwitches(port)) {
+            DbgPrint("[Gmux] WRITE8 port=0x%02X BLOCKED (GMUX_ALLOW_SWITCH=0)\n", port);
+            resp->Success = FALSE;
+            bytesReturned = sizeof(GMUX_WRITE_RESPONSE);
+            break;
+        }
         BOOLEAN okWrite = GmuxWrite8(context->MappedBase, port, val);
         resp->Success = okWrite;
         bytesReturned = sizeof(GMUX_WRITE_RESPONSE);
@@ -690,6 +805,36 @@ EvtIoDeviceControl(
 
         resp->Success = GmuxSwitchExternalRoute(context->MappedBase, req->TargetIsDiscrete);
         bytesReturned = sizeof(GMUX_SWITCH_RESPONSE);
+        break;
+    }
+    case IOCTL_GMUX_BL_GET: {
+        PGMUX_BL_GET_RESPONSE resp = NULL;
+        ULONG value = 0, max = 0;
+
+        status = WdfRequestRetrieveOutputBuffer(Request, sizeof(GMUX_BL_GET_RESPONSE), (PVOID*)&resp, NULL);
+        if (!NT_SUCCESS(status)) break;
+
+        resp->Success = GmuxGetBacklight(context->MappedBase, &value, &max);
+        resp->Value = value;
+        resp->Max = max;
+        bytesReturned = sizeof(GMUX_BL_GET_RESPONSE);
+        break;
+    }
+    case IOCTL_GMUX_BL_SET: {
+        PGMUX_BL_SET_REQUEST req = NULL;
+        PGMUX_BL_SET_RESPONSE resp = NULL;
+        ULONG value;
+
+        status = WdfRequestRetrieveInputBuffer(Request, sizeof(GMUX_BL_SET_REQUEST), (PVOID*)&req, NULL);
+        if (!NT_SUCCESS(status)) break;
+
+        status = WdfRequestRetrieveOutputBuffer(Request, sizeof(GMUX_BL_SET_RESPONSE), (PVOID*)&resp, NULL);
+        if (!NT_SUCCESS(status)) break;
+
+        // Shared METHOD_BUFFERED buffer: Success overlays Value, copy it first.
+        value = req->Value;
+        resp->Success = GmuxSetBacklight(context->MappedBase, value);
+        bytesReturned = sizeof(GMUX_BL_SET_RESPONSE);
         break;
     }
     case IOCTL_GMUX_POWER: {
