@@ -31,7 +31,7 @@ jobs:
           $repoRoot = if ($env:GITHUB_WORKSPACE) { $env:GITHUB_WORKSPACE } else { (Get-Location).Path }
           $buildDir = Join-Path $repoRoot 'build'
           Set-Location $repoRoot
-          cl /nologo /EHsc /W3 /DUNICODE /D_UNICODE .\gmux.cpp /I. /Fe"$buildDir\gmux_app.exe"
+          cl /nologo /EHsc /W3 /DUNICODE /D_UNICODE .\gmux.cpp /I. /Fe"$buildDir\gmux_app.exe" /link advapi32.lib setupapi.lib cfgmgr32.lib
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Copy INF for packaging

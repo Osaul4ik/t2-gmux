@@ -50,6 +50,7 @@
 
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "cfgmgr32.lib")
+#pragma comment(lib, "advapi32.lib")  // OpenProcessToken / AdjustTokenPrivileges / LookupPrivilegeValueW
 
 static const wchar_t* const VEN_AMD   = L"pci\\ven_1002";
 static const wchar_t* const VEN_INTEL = L"pci\\ven_8086";
