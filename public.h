@@ -30,6 +30,9 @@
 #define IOCTL_GMUX_CLEAR_DEFAULT CTL_CODE(FILE_DEVICE_UNKNOWN, 0x807, METHOD_BUFFERED, FILE_ANY_ACCESS)
 // External DP mux only (for testing one thing at a time; ROUTE already covers both muxes).
 #define IOCTL_GMUX_ROUTE_EXTERNAL CTL_CODE(FILE_DEVICE_UNKNOWN, 0x808, METHOD_BUFFERED, FILE_ANY_ACCESS)
+// Panel backlight (ports 0x74 / 0x70). Independent of which GPU drives the panel.
+#define IOCTL_GMUX_BL_GET         CTL_CODE(FILE_DEVICE_UNKNOWN, 0x809, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_GMUX_BL_SET         CTL_CODE(FILE_DEVICE_UNKNOWN, 0x80A, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 // Route values as WRITTEN to ports 0x10 (panel) and 0x40 (external). They are also what this
 // project stores as the boot default. Readback is different: the panel route is read from
@@ -98,3 +101,22 @@ typedef struct _GMUX_DEFAULT_RESPONSE {
 #define GMUX_PORT_DISCRETE_POWER  0x50   // dGPU power rail sequencing
 #define GMUX_PORT_MAX_BRIGHTNESS  0x70
 #define GMUX_PORT_BRIGHTNESS      0x74
+// Brightness is a 24-bit value (Linux apple-gmux.h)
+#define GMUX_BRIGHTNESS_MASK      0x00ffffff
+
+// Backlight get: no input; output reports current Value and Max (both masked)
+typedef struct _GMUX_BL_GET_RESPONSE {
+    BOOLEAN Success;
+    ULONG   Value;
+    ULONG   Max;
+} GMUX_BL_GET_RESPONSE, *PGMUX_BL_GET_RESPONSE;
+
+// Backlight set: input Value; output Success.
+// METHOD_BUFFERED: Success overlays the start of Value — copy Value first.
+typedef struct _GMUX_BL_SET_REQUEST {
+    ULONG Value;
+} GMUX_BL_SET_REQUEST, *PGMUX_BL_SET_REQUEST;
+
+typedef struct _GMUX_BL_SET_RESPONSE {
+    BOOLEAN Success;
+} GMUX_BL_SET_RESPONSE, *PGMUX_BL_SET_RESPONSE;
