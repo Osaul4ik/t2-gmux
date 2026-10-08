@@ -44,7 +44,7 @@
 // Reads and the backlight (0x70/0x74) still work. Nothing can black the panel.
 // Build with /DGMUX_ALLOW_SWITCH=1 to get the old behaviour back.
 #ifndef GMUX_ALLOW_SWITCH
-#define GMUX_ALLOW_SWITCH 0
+#define GMUX_ALLOW_SWITCH 1
 #endif
 
 // Plain (non-const) variable on purpose: no constant folding, so no unreachable-code warnings
