@@ -207,7 +207,133 @@ GmuxSetBacklight(_In_ PUCHAR Base, _In_ ULONG Value)
     return ok;
 }
 
-// ---- dGPU power rail sequencing (mirrors gmux_set_discrete_state) ----
+// ---- PEG root-port link retrain (Apple PWG1 / PWG3 without ACPI) ----
+//
+// SSDT maps PEG0 (PCI 00:01.0) enhanced config at SystemMemory 0xE0008000:
+//   0xB0 bit 5  LCRL  - Link Control.Retrain Link
+//   0xB2        Link Status (bit 11 = Link Training / LTRN)
+//   0xD0 low 4  LTLS  - Target Link Speed
+//
+// Linux apple-gmux power-on (MBP15,1, 2026):
+//   gmux 0x50 <- 2; 100ms; <- 3; PWG1; wait Vendor!=FFFF; PWG3
+// Without retrain, config stays 0xFFFF -> Windows hang / CATERR.
+
+#define PEG_CFG_PHYS     0xE0008000ULL
+#define PEG_CFG_SIZE     0x100
+
+#define PEG_OFF_LCTL     0xB0
+#define PEG_OFF_LSTS     0xB2
+#define PEG_OFF_LCTL2    0xD0
+
+#define PEG_LCTL_RETRAIN  (1u << 5)
+#define PEG_LSTS_TRAINING (1u << 11)
+
+// dGPU endpoint config candidates (PCIEXBAR + bus<<20 | dev<<15 | fn<<12)
+// PCIEXBAR is 0xE0000000 on these Macs (same base as PEG at +0x8000).
+#define PCIEXBAR_PHYS    0xE0000000ULL
+#define PCI_CFG_SIZE     0x1000
+
+static VOID
+PegDelayMs(_In_ ULONG Ms)
+{
+    LARGE_INTEGER interval;
+    interval.QuadPart = -((LONGLONG)Ms * 10000);
+    KeDelayExecutionThread(KernelMode, FALSE, &interval);
+}
+
+static PUCHAR
+MapPhys(_In_ ULONG64 Phys, _In_ SIZE_T Size)
+{
+    PHYSICAL_ADDRESS pa;
+    pa.QuadPart = (LONGLONG)Phys;
+    return (PUCHAR)MmMapIoSpaceEx(pa, Size, PAGE_READWRITE | PAGE_NOCACHE);
+}
+
+// PWG1 / PWG3 equivalent via PEG MMIO. targetSpeed 1 or 3.
+static BOOLEAN
+PegRetrain(_In_ UCHAR TargetSpeed)
+{
+    PUCHAR peg = MapPhys(PEG_CFG_PHYS, PEG_CFG_SIZE);
+    USHORT lctl, lsts;
+    UCHAR lctl2;
+    ULONG i;
+
+    if (!peg) {
+        DbgPrint("[Gmux] PEG: MmMapIoSpace 0x%llX failed\n", PEG_CFG_PHYS);
+        return FALSE;
+    }
+
+    // Sanity: must look like a bridge (vendor Intel 0x8086) when powered path is up
+    {
+        USHORT ven = *(volatile USHORT*)(peg + 0);
+        if (ven == 0xFFFF) {
+            DbgPrint("[Gmux] PEG: 00:01.0 vendor 0xFFFF (root port not reachable)\n");
+            MmUnmapIoSpace(peg, PEG_CFG_SIZE);
+            return FALSE;
+        }
+        DbgPrint("[Gmux] PEG: 00:01.0 vendor=0x%04X, retrain target=%u\n", ven, TargetSpeed);
+    }
+
+    lctl2 = *(volatile UCHAR*)(peg + PEG_OFF_LCTL2);
+    lctl2 = (UCHAR)((lctl2 & 0xF0) | (TargetSpeed & 0x0F));
+    *(volatile UCHAR*)(peg + PEG_OFF_LCTL2) = lctl2;
+
+    lctl = *(volatile USHORT*)(peg + PEG_OFF_LCTL);
+    lctl = (USHORT)(lctl | PEG_LCTL_RETRAIN);
+    *(volatile USHORT*)(peg + PEG_OFF_LCTL) = lctl;
+
+    for (i = 0; i < 500; i++) {
+        lsts = *(volatile USHORT*)(peg + PEG_OFF_LSTS);
+        if (!(lsts & PEG_LSTS_TRAINING))
+            break;
+        PegDelayMs(1);
+    }
+
+    lsts = *(volatile USHORT*)(peg + PEG_OFF_LSTS);
+    MmUnmapIoSpace(peg, PEG_CFG_SIZE);
+
+    if (i >= 500) {
+        DbgPrint("[Gmux] PEG: retrain timeout LSTS=0x%04X target=%u\n", lsts, TargetSpeed);
+        return FALSE;
+    }
+    DbgPrint("[Gmux] PEG: retrain done target=%u LSTS=0x%04X\n", TargetSpeed, lsts);
+    return TRUE;
+}
+
+// Poll dGPU endpoint Vendor ID via PCIEXBAR-mapped config for common BDF.
+static BOOLEAN
+WaitDgpuPciVisible(_In_ ULONG TimeoutMs)
+{
+    // bus 1/2/3, dev 0, fn 0 under PEG
+    static const ULONG buses[] = { 1, 2, 3, 4, 5 };
+    ULONG elapsed = 0;
+    ULONG b;
+
+    while (elapsed < TimeoutMs) {
+        for (b = 0; b < sizeof(buses) / sizeof(buses[0]); b++) {
+            ULONG64 phys = PCIEXBAR_PHYS
+                         + ((ULONG64)buses[b] << 20)
+                         + (0ULL << 15)   // dev 0
+                         + (0ULL << 12);  // fn 0
+            PUCHAR cfg = MapPhys(phys, 0x40);
+            if (!cfg)
+                continue;
+            USHORT ven = *(volatile USHORT*)(cfg + 0);
+            MmUnmapIoSpace(cfg, 0x40);
+            if (ven != 0xFFFF && ven != 0x0000) {
+                DbgPrint("[Gmux] dGPU PCI visible at %02lu:00.0 ven=0x%04X after %lu ms\n",
+                         buses[b], ven, elapsed);
+                return TRUE;
+            }
+        }
+        PegDelayMs(10);
+        elapsed += 10;
+    }
+    DbgPrint("[Gmux] dGPU PCI still invisible after %lu ms\n", TimeoutMs);
+    return FALSE;
+}
+
+// ---- dGPU power rail sequencing (Linux MBP15,1 PWG path) ----
 static BOOLEAN
 GmuxSetDiscretePower(_In_ PUCHAR Base, _In_ BOOLEAN PowerOn, _In_ ULONG SettleMs)
 {
@@ -215,30 +341,56 @@ GmuxSetDiscretePower(_In_ PUCHAR Base, _In_ BOOLEAN PowerOn, _In_ ULONG SettleMs
         DbgPrint("[Gmux] Discrete power change BLOCKED (GMUX_ALLOW_SWITCH=0)\n");
         return FALSE;
     }
-    BOOLEAN ok = GmuxWrite8(Base, GMUX_PORT_DISCRETE_POWER, 1);
-    ok = (BOOLEAN)(GmuxWrite8(Base, GMUX_PORT_DISCRETE_POWER, PowerOn ? 3 : 0) && ok);
 
-    // No ACPI GPE completion signal available here; approximate the
-    // interrupt-based wait Linux performs with a fixed settle delay.
-    LARGE_INTEGER interval;
-    interval.QuadPart = -((LONGLONG)SettleMs * 10000);
-    KeDelayExecutionThread(KernelMode, FALSE, &interval);
+    if (PowerOn) {
+        // Linux (use_pwg_power_sequence): 2 -> 100ms -> 3 -> PWG1 -> wait PCI -> PWG3
+        BOOLEAN ok = GmuxWrite8(Base, GMUX_PORT_DISCRETE_POWER, 2);
+        PegDelayMs(100);
+        ok = (BOOLEAN)(GmuxWrite8(Base, GMUX_PORT_DISCRETE_POWER, 3) && ok);
+        if (!ok) {
+            DbgPrint("[Gmux] Discrete power ON: gmux writes failed\n");
+            return FALSE;
+        }
 
-    DbgPrint("[Gmux] Discrete power %s: %d\n", PowerOn ? "ON" : "OFF", ok);
+        // Gen1 retrain (PWG1)
+        if (!PegRetrain(1)) {
+            DbgPrint("[Gmux] Discrete power ON: PWG1-equivalent retrain failed (continuing)\n");
+        }
 
-    // Diagnostics only (NOT cleared here: the ACPI GPE handler may own this register).
-    // MEASURED: at idle this reads a constant 0x1D (bits 0, 2, 3, 4) that nothing ever
-    // acknowledges - Linux clears it from its GPE handler - so bit 2 is already set and only a
-    // CHANGE of the value around a power command is informative.
+        if (!WaitDgpuPciVisible(1000)) {
+            DbgPrint("[Gmux] Discrete power ON: dGPU config space never came up\n");
+            // Still attempt gen3 retrain; caller may want to power back off.
+        }
+
+        // Gen3 retrain (PWG3)
+        if (!PegRetrain(3)) {
+            DbgPrint("[Gmux] Discrete power ON: PWG3-equivalent retrain failed\n");
+        }
+
+        // Optional extra settle for the AMD endpoint after link is up
+        if (SettleMs)
+            PegDelayMs(SettleMs);
+
+        DbgPrint("[Gmux] Discrete power ON: sequence complete\n");
+    } else {
+        // Linux OFF: 1, short delay, 0
+        BOOLEAN ok = GmuxWrite8(Base, GMUX_PORT_DISCRETE_POWER, 1);
+        PegDelayMs(10);
+        ok = (BOOLEAN)(GmuxWrite8(Base, GMUX_PORT_DISCRETE_POWER, 0) && ok);
+        if (SettleMs)
+            PegDelayMs(SettleMs);
+        DbgPrint("[Gmux] Discrete power OFF: %d\n", ok);
+        if (!ok)
+            return FALSE;
+    }
+
     {
         UCHAR st = 0;
         if (GmuxRead8(Base, GMUX_PORT_INTERRUPT_STATUS, &st)) {
-            DbgPrint("[Gmux] interrupt status after power change = 0x%02X (bit 2 = power done)\n", st);
-        } else {
-            DbgPrint("[Gmux] interrupt status read failed after power change\n");
+            DbgPrint("[Gmux] interrupt status after power change = 0x%02X\n", st);
         }
     }
-    return ok;
+    return TRUE;
 }
 
 // ---- Panel DDC/AUX line (port 0x28): 1 = iGPU, 2 = dGPU (NOT the 2/3 of ports 0x10/0x40) ----

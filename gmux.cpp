@@ -26,8 +26,9 @@
 //                          on Thunderbolt Macs; move it with `ext`)
 //   gmux ext i|d           external DP mux only (port 0x40) - use when the panel is fine but
 //                          an external monitor stays black
-//   gmux power on|off      dGPU power rail only (WARNING: off while the Radeon driver is
-//                          running can TDR/BSOD; on from Windows hung this machine - see `d power`)
+//   gmux power on|off      dGPU power rail (ON uses PWG-style PEG retrain: 2->3, gen1, wait
+//                          PCI, gen3). OFF: disable the AMD driver first. ON after rail was
+//                          cut should no longer hang if the driver is rebuilt with this sequence.
 //   gmux amd disable|enable   same as `gmux radeon off|on`
 //   gmux read <hexport>    raw 8-bit read of a gmux port, e.g. `gmux read 50`
 //   gmux write <hexport> <hexval>   raw 8-bit write, e.g. `gmux write 16 1D`. Port 0x50 is refused
@@ -529,7 +530,7 @@ static int CmdToRadeon(HANDLE h, bool powerCycle)
             printf("       Experimental, may hang: gmux d power\n");
             return 1;
         }
-        printf("  EXPERIMENTAL: rail power-on + PCI rescan - this is the sequence that hung the machine.\n");
+        printf("  rail power-on (PWG retrain) + PCI rescan ...\n");
         if (!Power(h, true)) { printf("ABORT: dGPU power-on failed; panel left where it was.\n"); return 1; }
         Sleep(500);
         RescanPci();
