@@ -13,7 +13,7 @@
 //   gmux radeon on|off     connect / disconnect the Radeon as a second GPU. Writes no display line (no
 //                          route, DDC, external mux): the panel stays on whatever GPU it is on. `on` also
 //                          raises the power rail + rescans PCI if the Radeon is missing from PnP. `off`
-//                          is a PnP disable. Not persistent.
+//                          disables it in PnP and then cuts the rail (inverse of `on`). Not persistent.
 //
 // Nothing is remembered between boots: every Windows boot starts as the firmware left the hardware.
 // `i` / `d` / `radeon` only last until the next reboot.
@@ -575,12 +575,15 @@ static int CmdToRadeon(HANDLE h, bool powerCycle)
 // panel route, DDC or external mux - so the panel stays exactly on the GPU it is on. The panel route is
 // read before and after and reported.
 //
-//   on  : Radeon in PnP but disabled/stopped -> PnP enable.
-//         Radeon missing from PnP (its rail was cut by `power off` / `i off`) -> rail on (port 0x50, power
-//         only) + PCI rescan, then PnP enable. This is the rail-on sequence that hung and powered off this
-//         machine when the Radeon had been cycled from Windows - it is only taken because `on` was asked
-//         for, and it needs a driver built with GMUX_ALLOW_SWITCH=1 (the rail write is blocked otherwise).
-//   off : PnP disable, non-persistent (see SetGpuState). The rail is not touched.
+//   on  : Radeon missing from PnP (rail off) -> rail on (port 0x50, power only) + PCI rescan, then PnP
+//         enable. Radeon in PnP but disabled/stopped -> PnP enable only. This is the rail-on sequence
+//         that hung this machine (observed twice: rail cycled from Windows, and rail off since boot with
+//         the AMD driver installed). It needs a driver built with GMUX_ALLOW_SWITCH=1 (the rail write
+//         is blocked otherwise).
+//   off : PnP disable (non-persistent, see SetGpuState), confirmed, THEN the rail is cut and PCI is
+//         rescanned so the stale node goes away - the inverse of `on`, so `off` leaves the machine as it
+//         was before `on`. The rail is never cut unless the PnP disable was confirmed (same gate as
+//         `i off`: powering off under a live driver is a BSOD risk).
 static int CmdRadeon(HANDLE h, bool enable)
 {
     printf("== Radeon %s (second GPU: display lines not touched) ==\n", enable ? "ON" : "OFF");
@@ -624,21 +627,27 @@ static int CmdRadeon(HANDLE h, bool enable)
             }
         }
     } else {
-        if (amd.problem == CM_PROB_DISABLED) {
-            printf("  already disabled - nothing to do.\n");
-            CmdStatus(h);
-            return 0;
-        }
         if (haveRoute && routeBefore == GMUX_ROUTE_DGPU) {
             printf("  WARNING: the panel is routed to the Radeon - it will freeze or go black until\n"
                    "           `gmux radeon on` (or a reboot).\n");
         }
-        printf("  disabling Radeon in PnP (non-persistent) ...\n");
-        if (!SetGpuState(VEN_AMD, DICS_DISABLE) || !WaitGpu(VEN_AMD, true, 8000)) {
-            printf("FAILED: Radeon is not confirmed disabled.\n");
+        if (amd.problem != CM_PROB_DISABLED) {
+            printf("  disabling Radeon in PnP (non-persistent) ...\n");
+            if (!SetGpuState(VEN_AMD, DICS_DISABLE) || !WaitGpu(VEN_AMD, true, 8000)) {
+                printf("ABORT: Radeon is NOT confirmed disabled; power rail left ON (powering off under a live driver = BSOD risk).\n");
+                CmdStatus(h);
+                return 1;
+            }
+        } else {
+            printf("  Radeon already disabled in PnP.\n");
+        }
+        if (!Power(h, false)) {
+            printf("FAILED: dGPU power-off write failed (driver built without GMUX_ALLOW_SWITCH=1?). Radeon is disabled, rail still ON.\n");
             CmdStatus(h);
             return 1;
         }
+        Sleep(500);
+        RescanPci();
     }
 
     UCHAR routeAfter = 0;
@@ -705,7 +714,8 @@ static void Usage()
            "  gmux d [power]             panel -> Radeon (never touches the power rail unless `power`)\n"
            "                             (-i / -d also accepted)\n"
            "  gmux radeon on|off         connect/disconnect the Radeon as a 2nd GPU, display lines untouched\n"
-           "                             (on: rail + PCI rescan if it is gone from PnP; off: PnP disable)\n"
+           "                             (on: rail on + PCI rescan if it is gone from PnP, then PnP enable;\n"
+           "                             off: PnP disable, then rail off - back to the state before `on`)\n"
            "                             not persistent (i, d and radeon last only until the next reboot)\n"
            "  gmux status                ports + Intel/Radeon PnP state\n"
            "  gmux trial [sec]           same as `gmux i`\n"
