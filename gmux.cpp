@@ -10,22 +10,25 @@
 //                          touches the power rail. If the Radeon is gone from PnP (rail was cut) it
 //                          refuses - reboot instead. `d power` forces the old rail-on + PCI rescan
 //                          sequence: EXPERIMENTAL, it hung and powered off this machine.
-//   gmux -default          store the CURRENT panel route as the boot default; the driver re-applies
-//                          it on every Windows boot (route only, never the power rail).
-//                          `gmux -default clear` removes it. `i` / `d` only last until the next reboot.
+//   gmux radeon on|off     connect / disconnect the Radeon as a second GPU. Writes no display line (no
+//                          route, DDC, external mux): the panel stays on whatever GPU it is on. `on` also
+//                          raises the power rail + rescans PCI if the Radeon is missing from PnP. `off`
+//                          is a PnP disable. Not persistent.
+//
+// Nothing is remembered between boots: every Windows boot starts as the firmware left the hardware.
+// `i` / `d` / `radeon` only last until the next reboot.
 //
 // Individual steps, for testing one thing at a time:
 //   gmux trial [sec]       same as `gmux i` without `off`
 //   gmux status            gmux ports (panel route decoded from 0x10 bit 0, DDC 0x28, interrupt
 //                          status 0x16) + Intel / Radeon PnP state
-//   gmux route i|d         DDC + panel mux (external DP mux is forced to the dGPU, like Linux does on
-//                          Thunderbolt Macs, unless the driver's ExternalFollowsPanel registry value is 1)
+//   gmux route i|d         DDC + panel mux (external DP mux is always forced to the dGPU, like Linux does
+//                          on Thunderbolt Macs; move it with `ext`)
 //   gmux ext i|d           external DP mux only (port 0x40) - use when the panel is fine but
 //                          an external monitor stays black
 //   gmux power on|off      dGPU power rail only (WARNING: off while the Radeon driver is
 //                          running can TDR/BSOD; on from Windows hung this machine - see `d power`)
-//   gmux amd disable|enable   PnP disable/enable of the Radeon display adapter (disable is NOT
-//                          persistent across reboots)
+//   gmux amd disable|enable   same as `gmux radeon off|on`
 //   gmux read <hexport>    raw 8-bit read of a gmux port, e.g. `gmux read 50`
 //   gmux write <hexport> <hexval>   raw 8-bit write, e.g. `gmux write 16 1D`. Port 0x50 is refused
 //                          here, use `gmux power`.
@@ -136,12 +139,6 @@ static bool Power(HANDLE h, bool on)
     GMUX_POWER_RESPONSE resp = { 0 };
     printf("  dGPU power rail -> %s ...\n", on ? "ON" : "OFF");
     return Ioctl(h, IOCTL_GMUX_POWER, &req, sizeof(req), &resp, sizeof(resp)) && resp.Success;
-}
-
-static bool DefaultIoctl(HANDLE h, DWORD code, GMUX_DEFAULT_RESPONSE* resp)
-{
-    ZeroMemory(resp, sizeof(*resp));
-    return Ioctl(h, code, NULL, 0, resp, sizeof(*resp)) && resp->Success;
 }
 
 static const char* RouteName(UCHAR r)
@@ -348,11 +345,12 @@ static bool PropChange(HDEVINFO set, SP_DEVINFO_DATA* dd, DWORD stateChange)
 
 // stateChange: DICS_DISABLE or DICS_ENABLE
 //
-// Disable is NON-persistent (CM_Disable_DevNode without CM_DISABLE_PERSIST). SetupDi DICS_DISABLE
-// writes CONFIGFLAG_DISABLED, which survives reboots - and the firmware puts the panel on the dGPU at
-// every boot, so a persistently disabled Radeon left the panel showing a frozen frame until it was
-// re-enabled by hand in Device Manager. Enable also clears that persistent flag, in case an older
-// build or Device Manager set it.
+// Disable is NON-persistent (CM_Disable_DevNode without CM_DISABLE_PERSIST) and there is deliberately no
+// fallback to SetupDi DICS_DISABLE: that writes CONFIGFLAG_DISABLED, which survives reboots - and the
+// firmware puts the panel on the dGPU at every boot, so a persistently disabled Radeon left the panel
+// showing a frozen frame until it was re-enabled by hand in Device Manager. If the non-persistent
+// disable fails, the command fails. Enable also clears that persistent flag, in case an older build
+// or Device Manager set it.
 static bool SetGpuState(const wchar_t* venTag, DWORD stateChange)
 {
     HDEVINFO set;
@@ -367,16 +365,15 @@ static bool SetGpuState(const wchar_t* venTag, DWORD stateChange)
         CONFIGRET cr = CM_Disable_DevNode(dd.DevInst, CM_DISABLE_UI_NOT_OK);
         ok = (cr == CR_SUCCESS);
         if (!ok) {
-            printf("  CM_Disable_DevNode failed (CR 0x%lX) - falling back to a PERSISTENT disable\n", (unsigned long)cr);
-            ok = PropChange(set, &dd, DICS_DISABLE);
+            printf("  CM_Disable_DevNode failed (CR 0x%lX)\n", (unsigned long)cr);
         }
     } else {
         bool cleared = PropChange(set, &dd, DICS_ENABLE);
         CONFIGRET cr = CM_Enable_DevNode(dd.DevInst, 0);
         ok = cleared || cr == CR_SUCCESS;
-    }
-    if (!ok) {
-        printf("  PnP %s failed: %lu\n", stateChange == DICS_DISABLE ? "disable" : "enable", GetLastError());
+        if (!ok) {
+            printf("  PnP enable failed: %lu (CR 0x%lX)\n", GetLastError(), (unsigned long)cr);
+        }
     }
     SetupDiDestroyDeviceInfoList(set);
     return ok;
@@ -429,12 +426,6 @@ static void CmdStatus(HANDLE h)
     PrintPort(h, GMUX_PORT_INTERRUPT_STATUS,   "interrupt status (0x16)");
     printf("  (0x11/0x41 are informational; 0x50 cannot be read back - compare before/after a command;\n"
            "   0x16 sits at a constant 0x1D on this machine because nothing acknowledges it)\n");
-    {
-        GMUX_DEFAULT_RESPONSE d;
-        if (DefaultIoctl(h, IOCTL_GMUX_GET_DEFAULT, &d)) {
-            printf("  boot default route              = %s\n", RouteName(d.Route));
-        }
-    }
     PrintBacklight(h);
     printf("adapters:\n");
     PrintGpu(L"Intel", VEN_INTEL);
@@ -490,7 +481,6 @@ static int CmdToIntel(HANDLE h, bool powerOff, DWORD seconds)
 
     if (!powerOff) {
         printf("  kept: panel stays on Intel until the next reboot (Radeon still enabled and powered).\n");
-        printf("  To make it permanent run `gmux -default`.\n");
         CmdStatus(h);
         return 0;
     }
@@ -581,36 +571,84 @@ static int CmdToRadeon(HANDLE h, bool powerCycle)
     return 0;
 }
 
-// Snapshot the current route as the boot default. An iGPU default is only accepted while the
-// Intel adapter is actually running - otherwise the next boot would come up on a dead panel.
-static int CmdDefault(HANDLE h, const char* arg)
+// Radeon as a second GPU: `on` connects it, `off` disconnects it. Neither writes a display line - no
+// panel route, DDC or external mux - so the panel stays exactly on the GPU it is on. The panel route is
+// read before and after and reported.
+//
+//   on  : Radeon in PnP but disabled/stopped -> PnP enable.
+//         Radeon missing from PnP (its rail was cut by `power off` / `i off`) -> rail on (port 0x50, power
+//         only) + PCI rescan, then PnP enable. This is the rail-on sequence that hung and powered off this
+//         machine when the Radeon had been cycled from Windows - it is only taken because `on` was asked
+//         for, and it needs a driver built with GMUX_ALLOW_SWITCH=1 (the rail write is blocked otherwise).
+//   off : PnP disable, non-persistent (see SetGpuState). The rail is not touched.
+static int CmdRadeon(HANDLE h, bool enable)
 {
-    GMUX_DEFAULT_RESPONSE d;
+    printf("== Radeon %s (second GPU: display lines not touched) ==\n", enable ? "ON" : "OFF");
 
-    if (!_stricmp(arg, "clear")) {
-        if (!DefaultIoctl(h, IOCTL_GMUX_CLEAR_DEFAULT, &d)) { printf("FAILED to clear the boot default.\n"); return 1; }
-        printf("Boot default cleared: the driver leaves the route as the firmware set it.\n");
-        return 0;
-    }
+    UCHAR routeBefore = 0;
+    bool haveRoute = PanelRoute(h, &routeBefore);
+    if (haveRoute) printf("  panel route now: %s\n", RouteName(routeBefore));
 
-    UCHAR cur = 0;
-    if (!PanelRoute(h, &cur)) { printf("ABORT: cannot read the current route.\n"); return 1; }
-    printf("current panel route (port 0x10 bit 0) -> %s\n", RouteName(cur));
+    GpuInfo amd;
+    bool present = QueryGpu(VEN_AMD, &amd);
 
-    if (cur == GMUX_ROUTE_IGD) {
-        GpuInfo intel;
-        if (!QueryGpu(VEN_INTEL, &intel) || !GpuRunning(intel)) {
-            printf("ABORT: refusing to store an iGPU default while the Intel adapter is not running.\n");
+    if (!present) {
+        if (!enable) {
+            printf("  the Radeon is not present in PnP - already off.\n");
+            CmdStatus(h);
+            return 0;
+        }
+        printf("  the Radeon is not in PnP (rail off): powering the rail and rescanning PCI.\n");
+        printf("  WARNING: this is the sequence that hung this machine before. Only the power rail is\n");
+        printf("           written - no panel / DDC / external route.\n");
+        if (!Power(h, true)) { printf("ABORT: dGPU power-on failed (driver built without GMUX_ALLOW_SWITCH=1?).\n"); return 1; }
+        Sleep(500);
+        RescanPci();
+        Sleep(1000);
+        if (!QueryGpu(VEN_AMD, &amd)) {
+            printf("ABORT: the Radeon did not reappear after power-on + PCI rescan.\n");
+            CmdStatus(h);
             return 1;
         }
-        printf("NOTE: at boot the driver only writes the route - nothing restarts the Intel adapter, so an\n"
-               "      iGPU boot default is UNTESTED. If the panel is black after a reboot, connect remotely\n"
-               "      and run `gmux -default clear` (or delete Parameters\\DefaultRoute under\n"
-               "      HKLM\\SYSTEM\\CurrentControlSet\\Services\\GmuxDriver), then reboot.\n");
     }
 
-    if (!DefaultIoctl(h, IOCTL_GMUX_SET_DEFAULT, &d)) { printf("FAILED to store the boot default.\n"); return 1; }
-    printf("Boot default stored: %s. Applied by the driver on every boot (route only, never the power rail).\n", RouteName(d.Route));
+    if (enable) {
+        if (GpuRunning(amd)) {
+            printf("  Radeon is running.\n");
+        } else {
+            printf("  enabling Radeon in PnP ...\n");
+            if (!SetGpuState(VEN_AMD, DICS_ENABLE) || !WaitGpu(VEN_AMD, false, 15000)) {
+                printf("FAILED: Radeon is not running after enable.\n");
+                CmdStatus(h);
+                return 1;
+            }
+        }
+    } else {
+        if (amd.problem == CM_PROB_DISABLED) {
+            printf("  already disabled - nothing to do.\n");
+            CmdStatus(h);
+            return 0;
+        }
+        if (haveRoute && routeBefore == GMUX_ROUTE_DGPU) {
+            printf("  WARNING: the panel is routed to the Radeon - it will freeze or go black until\n"
+                   "           `gmux radeon on` (or a reboot).\n");
+        }
+        printf("  disabling Radeon in PnP (non-persistent) ...\n");
+        if (!SetGpuState(VEN_AMD, DICS_DISABLE) || !WaitGpu(VEN_AMD, true, 8000)) {
+            printf("FAILED: Radeon is not confirmed disabled.\n");
+            CmdStatus(h);
+            return 1;
+        }
+    }
+
+    UCHAR routeAfter = 0;
+    if (haveRoute && PanelRoute(h, &routeAfter)) {
+        if (routeAfter == routeBefore) printf("  panel route unchanged: %s\n", RouteName(routeAfter));
+        else printf("  WARNING: panel route changed to %s - something else moved the mux.\n", RouteName(routeAfter));
+    }
+
+    printf("== done ==\n");
+    CmdStatus(h);
     return 0;
 }
 
@@ -666,14 +704,15 @@ static void Usage()
            "                             [sec] (default 20); `off` then also cuts the Radeon (experimental)\n"
            "  gmux d [power]             panel -> Radeon (never touches the power rail unless `power`)\n"
            "                             (-i / -d also accepted)\n"
-           "  gmux -default [clear]      store current route as boot default / remove it\n"
-           "                             (i and d last only until the next reboot)\n"
+           "  gmux radeon on|off         connect/disconnect the Radeon as a 2nd GPU, display lines untouched\n"
+           "                             (on: rail + PCI rescan if it is gone from PnP; off: PnP disable)\n"
+           "                             not persistent (i, d and radeon last only until the next reboot)\n"
            "  gmux status                ports + Intel/Radeon PnP state\n"
            "  gmux trial [sec]           same as `gmux i`\n"
            "  gmux route i|d             DDC + panel mux\n"
            "  gmux ext i|d               external DP mux only\n"
            "  gmux power on|off          dGPU power rail only (dangerous, see README)\n"
-           "  gmux amd disable|enable    PnP disable/enable of the Radeon (disable is not persistent)\n"
+           "  gmux amd disable|enable    same as `gmux radeon off|on`\n"
            "  gmux read <hexport>        raw port read, e.g. gmux read 50\n"
            "  gmux write <hexport> <hexval>   raw port write, e.g. gmux write 16 1D\n"
            "  gmux bl [<0-100>|+N|-N|raw <v>]   panel backlight via gmux (no arg = show)\n"
@@ -724,7 +763,6 @@ int main(int argc, char** argv)
     }
     else if (!_stricmp(cmd, "d"))       rc = CmdToRadeon(h, !_stricmp(a2, "power"));
     else if (!_stricmp(cmd, "status"))  { CmdStatus(h); rc = 0; }
-    else if (!_stricmp(cmd, "default")) rc = CmdDefault(h, a2);
     else if (!_stricmp(cmd, "route") && (*a2 == 'i' || *a2 == 'I' || *a2 == 'd' || *a2 == 'D')) {
         rc = Route(h, *a2 == 'd' || *a2 == 'D') ? 0 : 1;
         CmdStatus(h);
@@ -741,11 +779,9 @@ int main(int argc, char** argv)
         rc = Power(h, !_stricmp(a2, "on")) ? 0 : 1;
         CmdStatus(h);
     }
-    else if (!_stricmp(cmd, "amd") && (!_stricmp(a2, "disable") || !_stricmp(a2, "enable"))) {
-        bool disable = !_stricmp(a2, "disable");
-        rc = (SetGpuState(VEN_AMD, disable ? DICS_DISABLE : DICS_ENABLE) && WaitGpu(VEN_AMD, disable, 15000)) ? 0 : 1;
-        printf(rc == 0 ? "  OK\n" : "  FAILED / not confirmed\n");
-        CmdStatus(h);
+    else if ((!_stricmp(cmd, "radeon") || !_stricmp(cmd, "amd")) &&
+             (!_stricmp(a2, "on") || !_stricmp(a2, "enable") || !_stricmp(a2, "off") || !_stricmp(a2, "disable"))) {
+        rc = CmdRadeon(h, !_stricmp(a2, "on") || !_stricmp(a2, "enable"));
     }
     else if (!_stricmp(cmd, "bl") || !_stricmp(cmd, "backlight")) {
         rc = CmdBacklight(h, argc > 2 ? argv[2] : "", argc > 3 ? argv[3] : "");

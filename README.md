@@ -8,7 +8,16 @@ under Windows (MMIO gmux, ACPI\APP000B). Protocol taken from Linux `drivers/plat
     gmux status            ports, decoded panel route, Intel/Radeon state
     gmux i                 panel -> Intel, auto-reverts to the Radeon unless a key is pressed in 20 s
     gmux d                 panel -> Radeon
-    gmux -default          store the current route as the boot default
+    gmux radeon on|off     connect / disconnect the Radeon as a second GPU (display lines untouched)
+
+Nothing is remembered between boots: every Windows boot starts as the firmware left the hardware, so
+`i`, `d` and `radeon` only last until the next reboot.
+
+`gmux radeon on|off` never writes the panel route, DDC or external mux, so the panel stays on the GPU it
+is on and the Radeon is just a second adapter. `off` is a non-persistent PnP disable (rail untouched).
+`on` enables it in PnP; if the Radeon is missing from PnP (rail cut by `power off` / `i off`) it raises the
+rail (port 0x50, needs a driver built with `GMUX_ALLOW_SWITCH=1`) and rescans PCI first - the sequence
+that hung this machine, see below.
 
 `gmux i` keeps the Radeon enabled and powered, so the revert always has something to go back to.
 `gmux i off` additionally disables the Radeon (non-persistent) and cuts its rail - experimental, the
@@ -31,7 +40,7 @@ Measured on a MacBookPro16,1 (Radeon Pro 5300M + UHD 630):
 - Interrupt status 0x16 sits at a constant 0x1D; nothing acknowledges it (Linux clears it in its GPE
   handler), so "power done" cannot be read from it.
 - External mux 0x40: Linux never switches it on Thunderbolt Macs (forces 3 = dGPU). The driver does the
-  same unless `HKLM\SYSTEM\CurrentControlSet\Services\GmuxDriver\Parameters\ExternalFollowsPanel` (REG_DWORD) is 1.
+  same: `route` / `i` / `d` always leave it on the dGPU; `gmux ext i|d` moves it by hand.
 - Enabling the Radeon works if the card never lost power. After the rail was cycled through port 0x50
   from Windows (`gmux power on` / `gmux d power`), enabling it freezes the CPU (no BSOD) and the laptop
   powers off - the "system freeze, then sudden shutdown (CPU CATERR)" the t2linux wiki also describes for
@@ -57,8 +66,9 @@ Measured on a MacBookPro16,1 (Radeon Pro 5300M + UHD 630):
 
 ## Recovery
 
-- Black panel after a reboot with a boot default: connect remotely and run `gmux -default clear`, or
-  delete `Parameters\DefaultRoute` under the service key above, then reboot.
+- An older build stored a boot default in `Parameters\DefaultRoute` under the service key above. This
+  build ignores it; remove it with
+  `reg delete HKLM\SYSTEM\CurrentControlSet\Services\GmuxDriver\Parameters /v DefaultRoute /f`.
 - Radeon missing after `gmux i off`: reboot. Do not use `gmux d power` unless you accept a power-off.
-- `gmux amd disable` is no longer persistent. If an older build left the Radeon disabled, `gmux amd enable`
-  (or Device Manager) clears it.
+- `gmux radeon off` (alias `gmux amd disable`) is not persistent. If an older build left the Radeon disabled,
+  `gmux radeon on` (or Device Manager) clears it.
