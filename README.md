@@ -8,16 +8,18 @@ under Windows (MMIO gmux, ACPI\APP000B). Protocol taken from Linux `drivers/plat
     gmux status            ports, decoded panel route, Intel/Radeon state
     gmux i                 panel -> Intel, auto-reverts to the Radeon unless a key is pressed in 20 s
     gmux d                 panel -> Radeon
-    gmux radeon on|off     connect / disconnect the Radeon as a second GPU (display lines untouched)
+    gmux radeon on|off     enable / disable the Radeon in PnP only (no gmux port is written)
 
 Nothing is remembered between boots: every Windows boot starts as the firmware left the hardware, so
 `i`, `d` and `radeon` only last until the next reboot.
 
-`gmux radeon on|off` never writes the panel route, DDC or external mux, so the panel stays on the GPU it
-is on and the Radeon is just a second adapter. `off` is a non-persistent PnP disable (rail untouched).
-`on` enables it in PnP; if the Radeon is missing from PnP (rail cut by `power off` / `i off`) it raises the
-rail (port 0x50, needs a driver built with `GMUX_ALLOW_SWITCH=1`) and rescans PCI first - the sequence
-that hung this machine, see below.
+`gmux radeon on|off` never writes a gmux port (no panel route, DDC, external mux or power rail): it is a
+non-persistent PnP enable / disable, so the panel stays on the GPU it is on. The power rail has one owner:
+the ACPI power resource of loader mode 6 (`SSDT_IGPU_PWR.aml`, repo `t2-gmux-uefi`, branch `dGPU`). With that
+patch Windows puts the disabled, idle Radeon into D3 and the resource cuts the rail; `gmux radeon on` (or
+enabling it in Device Manager) brings it back. `gmux status` shows `power=D0` / `D3` for the Radeon. Without
+that patch `radeon off` only disables the adapter and the rail stays on. If the Radeon is gone from PnP the
+command refuses: it cannot be powered up from Windows (that hung this machine), reboot or use mode 6.
 
 `gmux i` keeps the Radeon enabled and powered, so the revert always has something to go back to.
 `gmux i off` additionally disables the Radeon (non-persistent) and cuts its rail - experimental, the
@@ -45,6 +47,22 @@ Measured on a MacBookPro16,1 (Radeon Pro 5300M + UHD 630):
   from Windows (`gmux power on` / `gmux d power`), enabling it freezes the CPU (no BSOD) and the laptop
   powers off - the "system freeze, then sudden shutdown (CPU CATERR)" the t2linux wiki also describes for
   this AMD GPU. Working theory: Windows does not know the card lost power (PnP disable is not D3cold).
+
+- Radeon rail off since boot (port 0x50 reads 0, Radeon absent from PnP), AMD driver installed: `gmux radeon on`
+  (rail on + PCI rescan) hung the machine. With the AMD driver removed there was no hang, but the Radeon
+  showed up as Microsoft Basic Display Adapter with problem 31 (`CM_PROB_FAILED_ADD`). Working theory: the
+  firmware never initialised the card this boot, so the AMD driver cannot start it. The rail should be
+  raised before the OS (UEFI stage), not from Windows.
+
+## Radeon power from Windows
+
+Apple's own AML (ssdt7, table id `PEG0GFX0`) already contains the correct power-up/power-down sequence for the
+Radeon: `GFX0.PWRD` -> `PUPD` writes gmux port 0x50, parks/enables the lanes, retrains the PCIe link and saves/
+restores the Navi bridge bus numbers (`SRBN`). Writing port 0x50 alone (what `gmux power on` and the old
+`radeon on` did) skips all of that, which is the likely root cause of the hang and of code 12 (hypothesis).
+Loader mode 6 of `t2-gmux-uefi` (branch `dGPU`) ships an ACPI patch that wraps `PWRD` in a power resource for
+the whole Radeon chain, plus a `_WAK` that puts the panel back on the iGPU after sleep. It is untested on
+hardware; see `docs/ACPI_PATCH_GUIDE_MODE6.md` and `docs/TECHNICAL.md` there.
 
 ## Why runtime switching to the iGPU is not expected to work (and what does)
 
