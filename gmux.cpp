@@ -21,7 +21,9 @@
 // Individual steps, for testing one thing at a time:
 //   gmux trial [sec]       same as `gmux i` without `off`
 //   gmux status            gmux ports (panel route decoded from 0x10 bit 0, DDC 0x28, interrupt
-//                          status 0x16) + Intel / Radeon PnP state
+//                          status 0x16) + Intel / Radeon PnP state, and the power state (D0..D3) of the
+//                          Radeon's PCI chain (PEG0 > EGP0 > EGP1 > GFX0 / HDAU): the rail can drop only
+//                          when every node of it is D3
 //   gmux route i|d         DDC + panel mux (external DP mux is always forced to the dGPU, like Linux does
 //                          on Thunderbolt Macs; move it with `ext`)
 //   gmux ext i|d           external DP mux only (port 0x40) - use when the panel is fine but
@@ -239,8 +241,23 @@ struct GpuInfo {
     ULONG   status;
     ULONG   problem;
     int     powerState;     // Windows device power state: 0 = D0 ... 3 = D3, -1 = unknown
+    DEVINST devInst;        // devnode, valid while found
     wchar_t desc[200];
 };
+
+// Most recent device power state kept by the power manager (CM_POWER_DATA): 0 = D0 ... 3 = D3, -1 =
+// unknown. D3 here means the device is idle in D3 (hot or cold - Windows does not say which).
+static int DevPowerState(DEVINST di)
+{
+    CM_POWER_DATA pd;
+    ULONG len = sizeof(pd);
+    ZeroMemory(&pd, sizeof(pd));
+    if (CM_Get_DevNode_Registry_PropertyW(di, CM_DRP_DEVICE_POWER_DATA, NULL, &pd, &len, 0) == CR_SUCCESS &&
+        pd.PD_MostRecentPowerState >= PowerDeviceD0 && pd.PD_MostRecentPowerState <= PowerDeviceD3) {
+        return (int)pd.PD_MostRecentPowerState - (int)PowerDeviceD0;
+    }
+    return -1;
+}
 
 static bool ContainsI(const wchar_t* s, const wchar_t* sub)
 {
@@ -303,16 +320,8 @@ static bool QueryGpu(const wchar_t* venTag, GpuInfo* gi)
     }
     CM_Get_DevNode_Status(&gi->status, &gi->problem, dd.DevInst, 0);
 
-    // Most recent device power state kept by the power manager (CM_POWER_DATA). D3 here means the
-    // device is idle in D3 (hot or cold - Windows does not say which).
-    gi->powerState = -1;
-    CM_POWER_DATA pd;
-    ULONG pdLen = sizeof(pd);
-    ZeroMemory(&pd, sizeof(pd));
-    if (CM_Get_DevNode_Registry_PropertyW(dd.DevInst, CM_DRP_DEVICE_POWER_DATA, NULL, &pd, &pdLen, 0) == CR_SUCCESS &&
-        pd.PD_MostRecentPowerState >= PowerDeviceD0 && pd.PD_MostRecentPowerState <= PowerDeviceD3) {
-        gi->powerState = (int)pd.PD_MostRecentPowerState - (int)PowerDeviceD0;
-    }
+    gi->devInst = dd.DevInst;
+    gi->powerState = DevPowerState(dd.DevInst);
     SetupDiDestroyDeviceInfoList(set);
     return true;
 }
@@ -341,6 +350,59 @@ static void PrintGpu(const wchar_t* label, const wchar_t* venTag)
     printf("  %-7ls %ls  [%ls]  status=0x%08lX problem=%lu", label, g.desc, Describe(g), g.status, g.problem);
     if (g.powerState >= 0) printf("  power=D%d", g.powerState);
     printf("\n");
+}
+
+static void DevLabel(DEVINST di, wchar_t* out, ULONG cch)
+{
+    ULONG len = cch * (ULONG)sizeof(wchar_t);
+    out[0] = 0;
+    if (CM_Get_DevNode_Registry_PropertyW(di, CM_DRP_FRIENDLYNAME, NULL, out, &len, 0) != CR_SUCCESS || !out[0]) {
+        len = cch * (ULONG)sizeof(wchar_t);
+        if (CM_Get_DevNode_Registry_PropertyW(di, CM_DRP_DEVICEDESC, NULL, out, &len, 0) != CR_SUCCESS) {
+            lstrcpynW(out, L"(unnamed)", (int)cch);
+        }
+    }
+}
+
+// One node of the Radeon's PCI chain, then its children (down to the display adapter / audio function,
+// not below them).
+static void PrintChainNode(DEVINST di, DEVINST mark, int depth)
+{
+    wchar_t name[160];
+    DevLabel(di, name, 160);
+    int ps = DevPowerState(di);
+    char pad[32];
+    int n = depth * 2;
+    if (n > 30) n = 30;
+    memset(pad, ' ', (size_t)n);
+    pad[n] = 0;
+    if (ps >= 0) printf("  %s%ls  power=D%d%s\n", pad, name, ps, di == mark ? "   <- display adapter" : "");
+    else         printf("  %s%ls  power=?%s\n", pad, name, di == mark ? "   <- display adapter" : "");
+    if (di == mark || depth >= 3) return;
+
+    DEVINST ch;
+    if (CM_Get_Child(&ch, di, 0) == CR_SUCCESS) {
+        do {
+            PrintChainNode(ch, mark, depth + 1);
+        } while (CM_Get_Sibling(&ch, ch, 0) == CR_SUCCESS);
+    }
+}
+
+// The Radeon rail is controlled by an ACPI power resource shared by this whole chain (loader mode 6):
+// it can only be cut when EVERY node here is in D3. So this shows what keeps it on.
+static void PrintRadeonChain()
+{
+    GpuInfo g;
+    if (!QueryGpu(VEN_AMD, &g)) return;
+
+    DEVINST top = g.devInst;
+    for (int i = 0; i < 3; ++i) {          // EGP1, EGP0, PEG0 (root port)
+        DEVINST up;
+        if (CM_Get_Parent(&up, top, 0) != CR_SUCCESS) break;
+        top = up;
+    }
+    printf("Radeon power chain (the rail can drop only when every node is D3):\n");
+    PrintChainNode(top, g.devInst, 0);
 }
 
 static bool PropChange(HDEVINFO set, SP_DEVINFO_DATA* dd, DWORD stateChange)
@@ -444,6 +506,7 @@ static void CmdStatus(HANDLE h)
     printf("adapters:\n");
     PrintGpu(L"Intel", VEN_INTEL);
     PrintGpu(L"Radeon", VEN_AMD);
+    PrintRadeonChain();
 }
 
 // Switch the panel to Intel with an automatic way back, optionally followed by cutting the Radeon.

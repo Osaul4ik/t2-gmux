@@ -17,7 +17,7 @@ Nothing is remembered between boots: every Windows boot starts as the firmware l
 non-persistent PnP enable / disable, so the panel stays on the GPU it is on. The power rail has one owner:
 the ACPI power resource of loader mode 6 (`SSDT_IGPU_PWR.aml`, repo `t2-gmux-uefi`, branch `dGPU`). With that
 patch Windows puts the disabled, idle Radeon into D3 and the resource cuts the rail; `gmux radeon on` (or
-enabling it in Device Manager) brings it back. `gmux status` shows `power=D0` / `D3` for the Radeon. Without
+enabling it in Device Manager) brings it back. `gmux status` shows `power=D0` / `D3` for the Radeon and for every node of its PCI chain (the rail can drop only when all of them are D3; port 0x50 reads 3 while the rail is on). Without
 that patch `radeon off` only disables the adapter and the rail stays on. If the Radeon is gone from PnP the
 command refuses: it cannot be powered up from Windows (that hung this machine), reboot or use mode 6.
 
