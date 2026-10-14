@@ -1,4 +1,6 @@
 # t2-gmux
+# DO NOT USE! IF YOU THINK YOU CAN, NO, YOU CAN'T.
+### THIS IS FOR THOSE WHO KNOW WHAT THEY'RE DOING.
 
 KMDF driver (`GmuxDriver.sys`) + console client (`gmux.exe`) for the Apple gmux on a T2 MacBook Pro
 under Windows (MMIO gmux, ACPI\APP000B). Protocol taken from Linux `drivers/platform/x86/apple-gmux.c`.
